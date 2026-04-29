@@ -117,10 +117,29 @@ jobs:
 
             curl -s -O "$BASE_URL/$HEADERS_DEB"
 
-            mkdir root
-            dpkg-deb -x "$HEADERS_DEB" root/
+            # Check if headers deb was downloaded and is not empty
+            if [ ! -s "$HEADERS_DEB" ]; then
+              echo "❌ Failed to download $HEADERS_DEB or file is empty"
+              echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | download failed |" >> "$SUMMARY"
+              echo "$HEADERS_DEB: download failed" >> "$MISSING_PAIRS"
+              continue
+            fi
 
-            KVER=$(ls root/usr/src | grep -m1 'linux-headers')
+            mkdir root
+            if ! dpkg-deb -x "$HEADERS_DEB" root/; then
+              echo "❌ Failed to extract $HEADERS_DEB"
+              echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | extract failed |" >> "$SUMMARY"
+              echo "$HEADERS_DEB: extract failed" >> "$MISSING_PAIRS"
+              continue
+            fi
+
+            KVER=$(ls root/usr/src | grep -m1 'linux-headers' || true)
+            if [ -z "$KVER" ]; then
+              echo "❌ No linux-headers directory found after extracting $HEADERS_DEB"
+              echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | no headers dir |" >> "$SUMMARY"
+              echo "$HEADERS_DEB: no headers dir" >> "$MISSING_PAIRS"
+              continue
+            fi
             KDIR="$GITHUB_WORKSPACE/root/usr/src/$KVER"
 
             echo "Headers version: $KVER"
