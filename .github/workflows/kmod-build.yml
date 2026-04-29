@@ -10,6 +10,10 @@ on:
         required: false
         type: number
         default: 3
+      kernel_version:
+        required: false
+        type: string
+        default: ''
       module_path:
         required: false
         type: string
@@ -33,26 +37,31 @@ jobs:
           sudo apt update
           sudo apt install -y build-essential jq curl xz-utils
 
-      - name: Detect latest Raspberry Pi kernels
+      - name: Detect or use specified Raspberry Pi kernel
         id: kernels
         run: |
           set -e
 
           ARCH="${{ matrix.arch }}"
           COUNT=${{ inputs.kernel_count }}
-
+          KERNEL_VERSION="${{ inputs.kernel_version }}"
           BASE_URL="https://archive.raspberrypi.org/debian/pool/main/l/linux"
 
-
-          # Download and filter unique kernel images
-          curl -s "$BASE_URL/" \
-            | grep -o "linux-image-[^\" ]*${ARCH}\.deb" \
-            | sort -u \
-            | sort -V \
-            | tail -n $COUNT > kernels.txt
-
-          echo "Detected kernels:"
-          cat kernels.txt
+          if [ -n "$KERNEL_VERSION" ]; then
+            # User-specified version, construct deb name directly
+            IMAGE_DEB="linux-image-${KERNEL_VERSION}_${ARCH}.deb"
+            echo "$IMAGE_DEB" > kernels.txt
+            echo "Using user-specified kernel: $IMAGE_DEB"
+          else
+            # Autodetect as before
+            curl -s "$BASE_URL/" \
+              | grep -o "linux-image-[^\" ]*${ARCH}\.deb" \
+              | sort -u \
+              | sort -V \
+              | tail -n $COUNT > kernels.txt
+            echo "Detected kernels:"
+            cat kernels.txt
+          fi
 
           echo "kernels=$(jq -R . kernels.txt | jq -s -c .)" >> $GITHUB_OUTPUT
 
