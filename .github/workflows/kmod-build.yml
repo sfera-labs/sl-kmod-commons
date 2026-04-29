@@ -31,10 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y \
-            build-essential \
-            bc bison flex libssl-dev make \
-            jq curl xz-utils
+          sudo apt install -y build-essential jq curl xz-utils
 
       - name: Detect latest Raspberry Pi kernels
         id: kernels
@@ -196,14 +193,19 @@ jobs:
           echo "MODULE_NAME=$(cat MODULE_NAME)" >> $GITHUB_ENV
 
       - name: Upload artifacts
-        if: steps.build.outcome == 'success'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ko-${{ matrix.arch }}
           path: artifacts/${{ matrix.arch }}/
 
+      - name: Show build summary
+        if: always()
+        run: |
+          echo "::notice file=summary.txt::$(cat $GITHUB_WORKSPACE/summary.txt)"
+
       - name: Fail with context
         if: steps.build.outcome == 'failure'
         run: |
-          echo "❌ One or more builds failed for arch ${{ matrix.arch }}"
+          echo "::error::❌ One or more builds failed for arch ${{ matrix.arch }}"
           exit 1
