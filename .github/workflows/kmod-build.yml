@@ -3,7 +3,7 @@ name: "Kernel Module build test"
 on:
   workflow_call:
     inputs:
-      arches:
+      archs:
         required: true
         type: string
       kernel_count:
@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: ${{ fromJson(inputs.arches) }}
+        arch: ${{ fromJson(inputs.archs) }}
 
     steps:
       - name: Checkout module repo
@@ -44,10 +44,10 @@ jobs:
           ARCH="${{ matrix.arch }}"
           COUNT=${{ inputs.kernel_count }}
 
-          BASE_URL="https://archive.raspberrypi.org/debian/pool/main/r/raspberrypi-kernel"
+          BASE_URL="https://archive.raspberrypi.org/debian/pool/main/l/linux"
 
           curl -s "$BASE_URL/" \
-            | grep -o "raspberrypi-kernel_[^\"]*${ARCH}.deb" \
+            | grep -o "linux-image-[^\" ]*${ARCH}\.deb" \
             | sort -V \
             | tail -n $COUNT > kernels.txt
 
@@ -63,41 +63,40 @@ jobs:
         run: |
           set -euo pipefail
 
-          BASE_URL="https://archive.raspberrypi.org/debian/pool/main/r/raspberrypi-kernel"
+          BASE_URL="https://archive.raspberrypi.org/debian/pool/main/l/linux"
           FAIL=0
 
           SUMMARY="$GITHUB_WORKSPACE/summary.txt"
           echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
           echo "|--------|------|--------|------|" >> "$SUMMARY"
 
-          echo '${{ steps.kernels.outputs.kernels }}' | jq -r '.[]' | while read KERNEL_DEB; do
+          echo '${{ steps.kernels.outputs.kernels }}' | jq -r '.[]' | while read IMAGE_DEB; do
 
-            HEADERS_DEB=$(echo "$KERNEL_DEB" | sed 's/raspberrypi-kernel/raspberrypi-kernel-headers/')
+            HEADERS_DEB=$(echo "$IMAGE_DEB" | sed 's/linux-image-/linux-headers-/')
 
             echo "========================================"
-            echo "Processing: $KERNEL_DEB"
+            echo "Processing: $IMAGE_DEB"
             echo "========================================"
 
-            # Check availability
-            if ! curl --silent --head --fail "$BASE_URL/$KERNEL_DEB" > /dev/null; then
-              echo "⚠️ Kernel package not found, skipping"
-              echo "| $KERNEL_DEB | ${{ matrix.arch }} | SKIP | kernel missing |" >> "$SUMMARY"
+            if ! curl --silent --head --fail "$BASE_URL/$IMAGE_DEB" > /dev/null; then
+              echo "⚠️ Kernel image not found, skipping"
+              echo "| $IMAGE_DEB | ${{ matrix.arch }} | SKIP | image missing |" >> "$SUMMARY"
               continue
             fi
 
             if ! curl --silent --head --fail "$BASE_URL/$HEADERS_DEB" > /dev/null; then
-              echo "⚠️ Headers package not found, skipping"
-              echo "| $KERNEL_DEB | ${{ matrix.arch }} | SKIP | headers missing |" >> "$SUMMARY"
+              echo "⚠️ Headers not found, skipping"
+              echo "| $IMAGE_DEB | ${{ matrix.arch }} | SKIP | headers missing |" >> "$SUMMARY"
               continue
             fi
 
             rm -rf root *.deb
 
-            curl -s -O "$BASE_URL/$KERNEL_DEB"
+            curl -s -O "$BASE_URL/$IMAGE_DEB"
             curl -s -O "$BASE_URL/$HEADERS_DEB"
 
             mkdir root
-            dpkg-deb -x "$KERNEL_DEB" root/
+            dpkg-deb -x "$IMAGE_DEB" root/
             dpkg-deb -x "$HEADERS_DEB" root/
 
             KVER=$(ls root/lib/modules)
