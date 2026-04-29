@@ -37,6 +37,11 @@ jobs:
           sudo apt update
           sudo apt install -y build-essential jq curl xz-utils gnupg
 
+      - name: Enable arm64 architecture for apt
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+
       - name: Add Raspberry Pi OS repository and GPG key
         run: |
           echo "deb http://archive.raspberrypi.org/debian/ bookworm main" | sudo tee /etc/apt/sources.list.d/raspi.list
@@ -52,14 +57,14 @@ jobs:
           ARCH="${{ matrix.arch }}"
           if [ -n "$KERNEL_VERSION" ]; then
             # Download only the specified version
-            apt download linux-headers-$KERNEL_VERSION || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION" && exit 1)
+            apt download linux-headers-$KERNEL_VERSION:arm64 || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION:arm64" && exit 1)
             echo "$KERNEL_VERSION" > kernel_versions.txt
           else
             # Autodetect latest kernel_count versions using apt list
-            apt list -a 2>/dev/null | grep linux-headers | grep $ARCH | grep -o '6\.[^ ]*' | sort -uV | tail -n $COUNT > kernel_versions.txt
+            apt list -a 2>/dev/null | grep linux-headers | grep :arm64 | grep -o '6\.[^ ]*' | sort -uV | tail -n $COUNT > kernel_versions.txt
             echo "Detected kernel versions:"; cat kernel_versions.txt
             while read VER; do
-              apt download linux-headers-$VER || echo "::error::Failed to download linux-headers-$VER"
+              apt download linux-headers-$VER:arm64 || echo "::error::Failed to download linux-headers-$VER:arm64"
             done < kernel_versions.txt
           fi
 
