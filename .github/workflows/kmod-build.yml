@@ -3,12 +3,13 @@ name: "Kernel Module build test"
 on:
   workflow_call:
     inputs:
-      kernel_branches:
+      arches:
         required: true
         type: string
-      defconfig_arch_matrix:
-        required: true
-        type: string
+      kernel_count:
+        required: false
+        type: number
+        default: 3
       module_path:
         required: false
         type: string
@@ -21,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        branch: ${{ fromJson(inputs.kernel_branches) }}
+        arch: ${{ fromJson(inputs.arches) }}
 
     steps:
       - name: Checkout module repo
@@ -31,92 +32,95 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y \
-            build-essential bc bison flex libssl-dev make \
-            gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabihf \
-            device-tree-compiler jq
+            build-essential \
+            bc bison flex libssl-dev make \
+            jq curl xz-utils
 
-      - name: Checkout Raspberry Pi kernel
+      - name: Detect latest Raspberry Pi kernels
+        id: kernels
         run: |
-          git clone \
-            --depth=1 \
-            --filter=blob:none \
-            --single-branch \
-            --branch ${{ matrix.branch }} \
-            https://github.com/raspberrypi/linux.git kernel
+          set -e
 
-      - name: Build all defconfigs for branch
+          ARCH="${{ matrix.arch }}"
+          COUNT=${{ inputs.kernel_count }}
+
+          BASE_URL="https://archive.raspberrypi.org/debian/pool/main/r/raspberrypi-kernel"
+
+          curl -s "$BASE_URL/" \
+            | grep -o "raspberrypi-kernel_[^\"]*${ARCH}.deb" \
+            | sort -V \
+            | tail -n $COUNT > kernels.txt
+
+          echo "Detected kernels:"
+          cat kernels.txt
+
+          echo "kernels=$(jq -R . kernels.txt | jq -s -c .)" >> $GITHUB_OUTPUT
+
+      - name: Build against kernels
         id: build
         working-directory: ${{ inputs.module_path }}
         continue-on-error: true
         run: |
           set -euo pipefail
 
-          COMBOS='${{ inputs.defconfig_arch_matrix }}'
+          BASE_URL="https://archive.raspberrypi.org/debian/pool/main/r/raspberrypi-kernel"
           FAIL=0
 
-          echo "$COMBOS" | jq -c '.[]' | while read combo; do
-            defconfig=$(echo "$combo" | jq -r .defconfig)
-            arch=$(echo "$combo" | jq -r .arch)
+          SUMMARY="$GITHUB_WORKSPACE/summary.txt"
+          echo "| Kernel | Arch | Result |" > "$SUMMARY"
+          echo "|--------|------|--------|" >> "$SUMMARY"
+
+          echo '${{ steps.kernels.outputs.kernels }}' | jq -r '.[]' | while read KERNEL_DEB; do
+
+            HEADERS_DEB=$(echo "$KERNEL_DEB" | sed 's/raspberrypi-kernel/raspberrypi-kernel-headers/')
+
+            rm -rf root *.deb
+
+            curl -s -O "$BASE_URL/$KERNEL_DEB"
+            curl -s -O "$BASE_URL/$HEADERS_DEB"
+
+            mkdir root
+            dpkg-deb -x "$KERNEL_DEB" root/
+            dpkg-deb -x "$HEADERS_DEB" root/
+
+            KVER=$(ls root/lib/modules)
+            KDIR="$GITHUB_WORKSPACE/root/lib/modules/$KVER/build"
 
             echo "========================================"
-            echo "Branch: ${{ matrix.branch }}"
-            echo "Defconfig: $defconfig"
-            echo "Arch: $arch"
+            echo "Kernel: $KVER"
+            echo "Arch: ${{ matrix.arch }}"
             echo "========================================"
 
-            case "$arch" in
-              arm64)
-                export ARCH=arm64
-                export CROSS_COMPILE=aarch64-linux-gnu-
-                ;;
-              arm)
-                export ARCH=arm
-                export CROSS_COMPILE=arm-linux-gnueabihf-
-                ;;
-              *)
-                echo "Unknown arch: $arch"
-                FAIL=1
-                continue
-                ;;
-            esac
-
-            # Prepare kernel
-            if ! make -C "$GITHUB_WORKSPACE/kernel" "$defconfig"; then
-              echo "❌ defconfig failed"
+            if make -C "$KDIR" M="$PWD" modules; then
+              echo "✅ Build OK"
+              RESULT="OK"
+            else
+              echo "❌ Build failed"
+              RESULT="FAIL"
               FAIL=1
-              continue
             fi
 
-            if ! make -C "$GITHUB_WORKSPACE/kernel" modules_prepare; then
-              echo "❌ modules_prepare failed"
-              FAIL=1
-              continue
+            echo "| $KVER | ${{ matrix.arch }} | $RESULT |" >> "$SUMMARY"
+
+            if [ "$RESULT" = "OK" ]; then
+              OUT="$GITHUB_WORKSPACE/artifacts/${{ matrix.arch }}/$KVER"
+              mkdir -p "$OUT"
+
+              cp -v ./*.ko "$OUT/" 2>/dev/null || true
+              cp -v ./*.dtbo "$OUT/" 2>/dev/null || true
             fi
-
-            # Build module
-            if ! make -C "$GITHUB_WORKSPACE/kernel" M="$PWD" modules; then
-              echo "❌ module build failed"
-              FAIL=1
-              continue
-            fi
-
-            echo "✅ Build succeeded for branch: ${{ matrix.branch }}, defconfig: $defconfig, arch: $arch"
-
-            # Collect artifacts
-            OUT="$GITHUB_WORKSPACE/artifacts/${{ matrix.branch }}/$arch/$defconfig"
-            mkdir -p "$OUT"
-
-            cp -v ./*.ko "$OUT/" 2>/dev/null || true
-            cp -v ./*.dtbo "$OUT/" 2>/dev/null || true
 
           done
+
+          echo ""
+          echo "========== BUILD SUMMARY =========="
+          cat "$SUMMARY"
+          echo "=================================="
 
           exit $FAIL
 
       - name: Detect module name
         if: steps.build.outcome == 'success'
-        id: detect_mod
         working-directory: ${{ inputs.module_path }}
         run: |
           if [ ! -f MODULE_NAME ]; then
@@ -129,11 +133,11 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: ko-${{ matrix.branch }}
-          path: artifacts/${{ matrix.branch }}/
+          name: ko-${{ matrix.arch }}
+          path: artifacts/${{ matrix.arch }}/
 
       - name: Fail with context
         if: steps.build.outcome == 'failure'
         run: |
-          echo "❌ One or more builds failed for branch ${{ matrix.branch }}"
+          echo "❌ One or more builds failed for arch ${{ matrix.arch }}"
           exit 1
