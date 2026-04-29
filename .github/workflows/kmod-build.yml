@@ -101,6 +101,8 @@ jobs:
               continue
             fi
 
+            echo "✅ Build succeeded for branch: ${{ matrix.branch }}, defconfig: $defconfig, arch: $arch"
+
             # Collect artifacts
             OUT="$GITHUB_WORKSPACE/artifacts/${{ matrix.branch }}/$arch/$defconfig"
             mkdir -p "$OUT"
