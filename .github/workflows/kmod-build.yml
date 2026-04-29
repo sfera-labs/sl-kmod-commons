@@ -35,7 +35,23 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y build-essential jq curl xz-utils
+          sudo apt install -y build-essential jq curl xz-utils gnupg
+
+      - name: Add Raspberry Pi OS repository and GPG key
+        run: |
+          echo "deb http://archive.raspberrypi.org/debian/ bookworm main" | sudo tee /etc/apt/sources.list.d/raspi.list
+          curl -fsSL https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/raspberrypi.gpg
+          sudo apt-get update
+
+      - name: Download kernel headers deb with apt
+        id: download_headers
+        run: |
+          KERNEL_VERSION="${{ inputs.kernel_version }}"
+          if [ -z "$KERNEL_VERSION" ]; then
+            echo "::error::kernel_version input is required for apt download step"
+            exit 1
+          fi
+          apt download linux-headers-$KERNEL_VERSION || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION" && exit 1)
 
       - name: Detect or use specified Raspberry Pi kernel
         id: kernels
