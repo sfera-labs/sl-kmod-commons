@@ -46,8 +46,11 @@ jobs:
 
           BASE_URL="https://archive.raspberrypi.org/debian/pool/main/l/linux"
 
+
+          # Download and filter unique kernel images
           curl -s "$BASE_URL/" \
             | grep -o "linux-image-[^\" ]*${ARCH}\.deb" \
+            | sort -u \
             | sort -V \
             | tail -n $COUNT > kernels.txt
 
@@ -70,6 +73,10 @@ jobs:
           echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
           echo "|--------|------|--------|------|" >> "$SUMMARY"
 
+          # Track missing image/header pairs
+          MISSING_PAIRS="$GITHUB_WORKSPACE/missing_pairs.txt"
+          : > "$MISSING_PAIRS"
+
           echo '${{ steps.kernels.outputs.kernels }}' | jq -r '.[]' | while read IMAGE_DEB; do
 
             HEADERS_DEB=$(echo "$IMAGE_DEB" | sed 's/linux-image-/linux-headers-/')
@@ -78,31 +85,45 @@ jobs:
             echo "Processing: $IMAGE_DEB"
             echo "========================================"
 
-            if ! curl --silent --head --fail "$BASE_URL/$IMAGE_DEB" > /dev/null; then
-              echo "⚠️ Kernel image not found, skipping"
-              echo "| $IMAGE_DEB | ${{ matrix.arch }} | SKIP | image missing |" >> "$SUMMARY"
-              continue
+            IMAGE_OK=0
+            HEADERS_OK=0
+            if curl --silent --head --fail "$BASE_URL/$IMAGE_DEB" > /dev/null; then
+              IMAGE_OK=1
+            fi
+            if curl --silent --head --fail "$BASE_URL/$HEADERS_DEB" > /dev/null; then
+              HEADERS_OK=1
             fi
 
-            if ! curl --silent --head --fail "$BASE_URL/$HEADERS_DEB" > /dev/null; then
+            if [ "$IMAGE_OK" -eq 0 ] && [ "$HEADERS_OK" -eq 0 ]; then
+              echo "⚠️ Both image and headers not found, skipping"
+              echo "| $IMAGE_DEB | ${{ matrix.arch }} | SKIP | both missing |" >> "$SUMMARY"
+              echo "$IMAGE_DEB: both image and headers missing" >> "$MISSING_PAIRS"
+              continue
+            fi
+            if [ "$IMAGE_OK" -eq 0 ]; then
+              echo "⚠️ Kernel image not found, skipping"
+              echo "| $IMAGE_DEB | ${{ matrix.arch }} | SKIP | image missing |" >> "$SUMMARY"
+              echo "$IMAGE_DEB: image missing" >> "$MISSING_PAIRS"
+              continue
+            fi
+            if [ "$HEADERS_OK" -eq 0 ]; then
               echo "⚠️ Headers not found, skipping"
               echo "| $IMAGE_DEB | ${{ matrix.arch }} | SKIP | headers missing |" >> "$SUMMARY"
+              echo "$IMAGE_DEB: headers missing" >> "$MISSING_PAIRS"
               continue
             fi
 
             rm -rf root *.deb
 
-            curl -s -O "$BASE_URL/$IMAGE_DEB"
             curl -s -O "$BASE_URL/$HEADERS_DEB"
 
             mkdir root
-            dpkg-deb -x "$IMAGE_DEB" root/
             dpkg-deb -x "$HEADERS_DEB" root/
 
-            KVER=$(ls root/lib/modules)
-            KDIR="$GITHUB_WORKSPACE/root/lib/modules/$KVER/build"
+            KVER=$(ls root/usr/src | grep -m1 'linux-headers')
+            KDIR="$GITHUB_WORKSPACE/root/usr/src/$KVER"
 
-            echo "Kernel version: $KVER"
+            echo "Headers version: $KVER"
             echo "Build dir: $KDIR"
 
             if make -C "$KDIR" M="$PWD" modules; then
@@ -132,6 +153,16 @@ jobs:
           echo "========== BUILD SUMMARY =========="
           cat "$SUMMARY"
           echo "=================================="
+
+
+          # Log missing pairs summary if any
+          if [ -s "$MISSING_PAIRS" ]; then
+            echo "" >> "$SUMMARY"
+            echo "## Missing image/header pairs:" >> "$SUMMARY"
+            cat "$MISSING_PAIRS" >> "$SUMMARY"
+            echo "" >> "$SUMMARY"
+            echo "⚠️ Some kernel image/header pairs were missing. See summary above."
+          fi
 
           exit $FAIL
 
