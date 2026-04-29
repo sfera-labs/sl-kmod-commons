@@ -3,7 +3,10 @@ name: "Kernel Module build test"
 on:
   workflow_call:
     inputs:
-      kernel_version:
+      kernel_branches:
+        required: true
+        type: string
+      defconfig_arch_matrix:
         required: true
         type: string
       module_path:
@@ -14,45 +17,121 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson(inputs.kernel_branches) }}
+
     steps:
       - name: Checkout module repo
         uses: actions/checkout@v4
 
-      - name: Install cross-compiler and tools
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf device-tree-compiler bc bison flex libssl-dev make
+          sudo apt update
+          sudo apt install -y \
+            build-essential bc bison flex libssl-dev make \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            device-tree-compiler jq
 
-      - name: Install Raspberry Pi kernel headers
+      - name: Checkout Raspberry Pi kernel
         run: |
-          sudo apt-get install -y linux-headers-${{ inputs.kernel_version }} || {
-            echo "Kernel headers for ${{ inputs.kernel_version }} not found in default repos.";
-            exit 1;
-          }
-          export KDIR=/lib/modules/${{ inputs.kernel_version }}/build
-          echo "KDIR=$KDIR" >> $GITHUB_ENV
+          git clone \
+            --depth=1 \
+            --filter=blob:none \
+            --single-branch \
+            --branch ${{ matrix.branch }} \
+            https://github.com/raspberrypi/linux.git kernel
 
-      - name: Build kernel module
+      - name: Build all defconfigs for branch
+        id: build
         working-directory: ${{ inputs.module_path }}
-        env:
-          ARCH: arm
-          CROSS_COMPILE: arm-linux-gnueabihf-
-          KDIR: ${{ env.KDIR }}
+        continue-on-error: true
         run: |
-          make clean
-          make
+          set -euo pipefail
+
+          COMBOS='${{ inputs.defconfig_arch_matrix }}'
+          FAIL=0
+
+          echo "$COMBOS" | jq -c '.[]' | while read combo; do
+            defconfig=$(echo "$combo" | jq -r .defconfig)
+            arch=$(echo "$combo" | jq -r .arch)
+
+            echo "========================================"
+            echo "Branch: ${{ matrix.branch }}"
+            echo "Defconfig: $defconfig"
+            echo "Arch: $arch"
+            echo "========================================"
+
+            case "$arch" in
+              arm64)
+                export ARCH=arm64
+                export CROSS_COMPILE=aarch64-linux-gnu-
+                ;;
+              arm)
+                export ARCH=arm
+                export CROSS_COMPILE=arm-linux-gnueabihf-
+                ;;
+              *)
+                echo "Unknown arch: $arch"
+                FAIL=1
+                continue
+                ;;
+            esac
+
+            # Prepare kernel
+            if ! make -C "$GITHUB_WORKSPACE/kernel" "$defconfig"; then
+              echo "❌ defconfig failed"
+              FAIL=1
+              continue
+            fi
+
+            if ! make -C "$GITHUB_WORKSPACE/kernel" modules_prepare; then
+              echo "❌ modules_prepare failed"
+              FAIL=1
+              continue
+            fi
+
+            # Build module
+            if ! make -C "$GITHUB_WORKSPACE/kernel" M="$PWD" modules; then
+              echo "❌ module build failed"
+              FAIL=1
+              continue
+            fi
+
+            # Collect artifacts
+            OUT="$GITHUB_WORKSPACE/artifacts/${{ matrix.branch }}/$arch/$defconfig"
+            mkdir -p "$OUT"
+
+            cp -v ./*.ko "$OUT/" 2>/dev/null || true
+            cp -v ./*.dtbo "$OUT/" 2>/dev/null || true
+
+          done
+
+          exit $FAIL
 
       - name: Detect module name
+        if: steps.build.outcome == 'success'
         id: detect_mod
+        working-directory: ${{ inputs.module_path }}
         run: |
-          modname=$(cat ${{ inputs.module_path }}/MODULE_NAME)
-          echo "MODULE_NAME=$modname" >> $GITHUB_ENV
+          if [ ! -f MODULE_NAME ]; then
+            echo "MODULE_NAME file not found!" >&2
+            exit 1
+          fi
+          echo "MODULE_NAME=$(cat MODULE_NAME)" >> $GITHUB_ENV
 
-      - name: Upload .ko and .dtbo artifacts
+      - name: Upload artifacts
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.MODULE_NAME }}-artifacts
-          path: |
-            ${{ inputs.module_path }}/${{ env.MODULE_NAME }}.ko
-            ${{ inputs.module_path }}/${{ env.MODULE_NAME }}.dtbo
-        if: always()
+          name: ko-${{ matrix.branch }}
+          path: artifacts/${{ matrix.branch }}/
+
+      - name: Fail with context
+        if: steps.build.outcome == 'failure'
+        run: |
+          echo "❌ One or more builds failed for branch ${{ matrix.branch }}"
+          exit 1
