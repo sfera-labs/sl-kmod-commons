@@ -67,12 +67,29 @@ jobs:
           FAIL=0
 
           SUMMARY="$GITHUB_WORKSPACE/summary.txt"
-          echo "| Kernel | Arch | Result |" > "$SUMMARY"
-          echo "|--------|------|--------|" >> "$SUMMARY"
+          echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
+          echo "|--------|------|--------|------|" >> "$SUMMARY"
 
           echo '${{ steps.kernels.outputs.kernels }}' | jq -r '.[]' | while read KERNEL_DEB; do
 
             HEADERS_DEB=$(echo "$KERNEL_DEB" | sed 's/raspberrypi-kernel/raspberrypi-kernel-headers/')
+
+            echo "========================================"
+            echo "Processing: $KERNEL_DEB"
+            echo "========================================"
+
+            # Check availability
+            if ! curl --silent --head --fail "$BASE_URL/$KERNEL_DEB" > /dev/null; then
+              echo "⚠️ Kernel package not found, skipping"
+              echo "| $KERNEL_DEB | ${{ matrix.arch }} | SKIP | kernel missing |" >> "$SUMMARY"
+              continue
+            fi
+
+            if ! curl --silent --head --fail "$BASE_URL/$HEADERS_DEB" > /dev/null; then
+              echo "⚠️ Headers package not found, skipping"
+              echo "| $KERNEL_DEB | ${{ matrix.arch }} | SKIP | headers missing |" >> "$SUMMARY"
+              continue
+            fi
 
             rm -rf root *.deb
 
@@ -86,21 +103,21 @@ jobs:
             KVER=$(ls root/lib/modules)
             KDIR="$GITHUB_WORKSPACE/root/lib/modules/$KVER/build"
 
-            echo "========================================"
-            echo "Kernel: $KVER"
-            echo "Arch: ${{ matrix.arch }}"
-            echo "========================================"
+            echo "Kernel version: $KVER"
+            echo "Build dir: $KDIR"
 
             if make -C "$KDIR" M="$PWD" modules; then
               echo "✅ Build OK"
               RESULT="OK"
+              NOTE=""
             else
               echo "❌ Build failed"
               RESULT="FAIL"
+              NOTE=""
               FAIL=1
             fi
 
-            echo "| $KVER | ${{ matrix.arch }} | $RESULT |" >> "$SUMMARY"
+            echo "| $KVER | ${{ matrix.arch }} | $RESULT | $NOTE |" >> "$SUMMARY"
 
             if [ "$RESULT" = "OK" ]; then
               OUT="$GITHUB_WORKSPACE/artifacts/${{ matrix.arch }}/$KVER"
