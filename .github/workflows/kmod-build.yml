@@ -40,13 +40,14 @@ jobs:
       - name: Enable arm64 architecture for apt
         run: |
           sudo dpkg --add-architecture arm64
-          sudo apt-get update
+          # Allow apt-get update to succeed even if some arm64 indexes are missing
+          sudo apt-get update --allow-releaseinfo-change || true
 
       - name: Add Raspberry Pi OS repository and GPG key
         run: |
           echo "deb http://archive.raspberrypi.org/debian/ bookworm main" | sudo tee /etc/apt/sources.list.d/raspi.list
           curl -fsSL https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/raspberrypi.gpg
-          sudo apt-get update
+          sudo apt-get update --allow-releaseinfo-change || true
 
       - name: Download kernel headers deb(s) with apt
         id: download_headers
