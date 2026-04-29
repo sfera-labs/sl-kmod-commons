@@ -43,43 +43,32 @@ jobs:
           curl -fsSL https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/raspberrypi.gpg
           sudo apt-get update
 
-      - name: Download kernel headers deb with apt
+      - name: Download kernel headers deb(s) with apt
         id: download_headers
         run: |
+          set -e
           KERNEL_VERSION="${{ inputs.kernel_version }}"
-          if [ -z "$KERNEL_VERSION" ]; then
-            echo "::error::kernel_version input is required for apt download step"
-            exit 1
+          COUNT=${{ inputs.kernel_count }}
+          ARCH="${{ matrix.arch }}"
+          if [ -n "$KERNEL_VERSION" ]; then
+            # Download only the specified version
+            apt download linux-headers-$KERNEL_VERSION || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION" && exit 1)
+            echo "$KERNEL_VERSION" > kernel_versions.txt
+          else
+            # Autodetect latest kernel_count versions using apt list
+            apt list -a 2>/dev/null | grep linux-headers | grep $ARCH | grep -o '6\.[^ ]*' | sort -uV | tail -n $COUNT > kernel_versions.txt
+            echo "Detected kernel versions:"; cat kernel_versions.txt
+            while read VER; do
+              apt download linux-headers-$VER || echo "::error::Failed to download linux-headers-$VER"
+            done < kernel_versions.txt
           fi
-          apt download linux-headers-$KERNEL_VERSION || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION" && exit 1)
 
-      - name: Detect or use specified Raspberry Pi kernel
+      - name: Set kernel versions for build
         id: kernels
         run: |
           set -e
-
-          ARCH="${{ matrix.arch }}"
-          COUNT=${{ inputs.kernel_count }}
-          KERNEL_VERSION="${{ inputs.kernel_version }}"
-          BASE_URL="https://archive.raspberrypi.org/debian/pool/main/l/linux"
-
-          if [ -n "$KERNEL_VERSION" ]; then
-            # User-specified version, construct deb name directly
-            IMAGE_DEB="linux-image-${KERNEL_VERSION}_${ARCH}.deb"
-            echo "$IMAGE_DEB" > kernels.txt
-            echo "Using user-specified kernel: $IMAGE_DEB"
-          else
-            # Autodetect as before
-            curl -s "$BASE_URL/" \
-              | grep -o "linux-image-[^\" ]*${ARCH}\.deb" \
-              | sort -u \
-              | sort -V \
-              | tail -n $COUNT > kernels.txt
-            echo "Detected kernels:"
-            cat kernels.txt
-          fi
-
-          echo "kernels=$(jq -R . kernels.txt | jq -s -c .)" >> $GITHUB_OUTPUT
+          cat kernel_versions.txt | jq -R . | jq -s -c . > kernel_versions.json
+          echo "kernels=$(cat kernel_versions.json)" >> $GITHUB_OUTPUT
 
       - name: Build against kernels
         id: build
@@ -88,83 +77,38 @@ jobs:
         run: |
           set -euo pipefail
 
-          BASE_URL="https://archive.raspberrypi.org/debian/pool/main/l/linux"
           FAIL=0
-
           SUMMARY="$GITHUB_WORKSPACE/summary.txt"
           echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
           echo "|--------|------|--------|------|" >> "$SUMMARY"
 
-          # Track missing image/header pairs
-          MISSING_PAIRS="$GITHUB_WORKSPACE/missing_pairs.txt"
-          : > "$MISSING_PAIRS"
-
-          echo '${{ steps.kernels.outputs.kernels }}' | jq -r '.[]' | while read IMAGE_DEB; do
-
-            HEADERS_DEB=$(echo "$IMAGE_DEB" | sed 's/linux-image-/linux-headers-/')
-
-            echo "========================================"
-            echo "Processing: $IMAGE_DEB"
-            echo "========================================"
-
-            IMAGE_OK=0
-            HEADERS_OK=0
-            if curl --silent --head --fail "$BASE_URL/$IMAGE_DEB" > /dev/null; then
-              IMAGE_OK=1
-            fi
-            if curl --silent --head --fail "$BASE_URL/$HEADERS_DEB" > /dev/null; then
-              HEADERS_OK=1
-            fi
-
-            if [ "$IMAGE_OK" -eq 0 ] && [ "$HEADERS_OK" -eq 0 ]; then
-              echo "⚠️ Both image and headers not found, skipping"
-              echo "| $IMAGE_DEB | ${{ matrix.arch }} | SKIP | both missing |" >> "$SUMMARY"
-              echo "$IMAGE_DEB: both image and headers missing" >> "$MISSING_PAIRS"
-              continue
-            fi
-            if [ "$IMAGE_OK" -eq 0 ]; then
-              echo "⚠️ Kernel image not found, skipping"
-              echo "| $IMAGE_DEB | ${{ matrix.arch }} | SKIP | image missing |" >> "$SUMMARY"
-              echo "$IMAGE_DEB: image missing" >> "$MISSING_PAIRS"
-              continue
-            fi
-            if [ "$HEADERS_OK" -eq 0 ]; then
-              echo "⚠️ Headers not found, skipping"
-              echo "| $IMAGE_DEB | ${{ matrix.arch }} | SKIP | headers missing |" >> "$SUMMARY"
-              echo "$IMAGE_DEB: headers missing" >> "$MISSING_PAIRS"
-              continue
-            fi
-
-            rm -rf root *.deb
-
-            curl -s -O "$BASE_URL/$HEADERS_DEB"
-
-            # Check if headers deb was downloaded and is not empty
+          # Clean up and extract the downloaded deb
+          rm -rf root
+          mkdir root
+          while read KVER; do
+            HEADERS_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER*.deb | head -n1)
             if [ ! -s "$HEADERS_DEB" ]; then
-              echo "❌ Failed to download $HEADERS_DEB or file is empty"
+              echo "❌ Downloaded headers deb not found or empty: $HEADERS_DEB"
               echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | download failed |" >> "$SUMMARY"
-              echo "$HEADERS_DEB: download failed" >> "$MISSING_PAIRS"
               continue
             fi
-
+            rm -rf root
             mkdir root
             if ! dpkg-deb -x "$HEADERS_DEB" root/; then
               echo "❌ Failed to extract $HEADERS_DEB"
               echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | extract failed |" >> "$SUMMARY"
-              echo "$HEADERS_DEB: extract failed" >> "$MISSING_PAIRS"
               continue
             fi
 
-            KVER=$(ls root/usr/src | grep -m1 'linux-headers' || true)
-            if [ -z "$KVER" ]; then
+            HDRDIR=$(ls root/usr/src | grep -m1 'linux-headers' || true)
+            if [ -z "$HDRDIR" ]; then
               echo "❌ No linux-headers directory found after extracting $HEADERS_DEB"
               echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | no headers dir |" >> "$SUMMARY"
-              echo "$HEADERS_DEB: no headers dir" >> "$MISSING_PAIRS"
               continue
             fi
-            KDIR="$GITHUB_WORKSPACE/root/usr/src/$KVER"
+            KDIR="$GITHUB_WORKSPACE/root/usr/src/$HDRDIR"
 
-            echo "Headers version: $KVER"
+            echo "Headers version: $HDRDIR"
             echo "Build dir: $KDIR"
 
             if make -C "$KDIR" M="$PWD" modules; then
@@ -178,33 +122,20 @@ jobs:
               FAIL=1
             fi
 
-            echo "| $KVER | ${{ matrix.arch }} | $RESULT | $NOTE |" >> "$SUMMARY"
+            echo "| $HDRDIR | ${{ matrix.arch }} | $RESULT | $NOTE |" >> "$SUMMARY"
 
             if [ "$RESULT" = "OK" ]; then
-              OUT="$GITHUB_WORKSPACE/artifacts/${{ matrix.arch }}/$KVER"
+              OUT="$GITHUB_WORKSPACE/artifacts/${{ matrix.arch }}/$HDRDIR"
               mkdir -p "$OUT"
-
               cp -v ./*.ko "$OUT/" 2>/dev/null || true
               cp -v ./*.dtbo "$OUT/" 2>/dev/null || true
             fi
-
-          done
+          done < kernel_versions.txt
 
           echo ""
           echo "========== BUILD SUMMARY =========="
           cat "$SUMMARY"
           echo "=================================="
-
-
-          # Log missing pairs summary if any
-          if [ -s "$MISSING_PAIRS" ]; then
-            echo "" >> "$SUMMARY"
-            echo "## Missing image/header pairs:" >> "$SUMMARY"
-            cat "$MISSING_PAIRS" >> "$SUMMARY"
-            echo "" >> "$SUMMARY"
-            echo "⚠️ Some kernel image/header pairs were missing. See summary above."
-          fi
-
           exit $FAIL
 
       - name: Detect module name
