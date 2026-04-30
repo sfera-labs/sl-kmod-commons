@@ -59,15 +59,10 @@ jobs:
           if [ -n "$KERNEL_VERSION" ]; then
             # Download arch-specific headers
             apt download linux-headers-$KERNEL_VERSION:arm64 || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION:arm64" && exit 1)
-            # Dynamically find the correct common headers package
+            # Extract base version for common headers (e.g., 6.12.75+rpt)
             BASE_VERSION=$(echo "$KERNEL_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
-            COMMON_PKG=$(apt list -a "linux-headers-*-common-rpi:arm64" 2>/dev/null | grep "$BASE_VERSION" | head -n1 | awk -F/ '{print $1}')
-            if [ -n "$COMMON_PKG" ]; then
-              apt download "$COMMON_PKG:arm64" || (echo "::error::Failed to download $COMMON_PKG:arm64" && exit 1)
-            else
-              echo "::error::Failed to find common headers for $KERNEL_VERSION"
-              exit 1
-            fi
+            COMMON_PKG="linux-headers-${BASE_VERSION}-common-rpi"
+            apt download "$COMMON_PKG:arm64" || (echo "::error::Failed to download $COMMON_PKG:arm64" && exit 1)
             echo "$KERNEL_VERSION" > kernel_versions.txt
           else
             # Autodetect latest kernel_count versions using apt list
@@ -76,13 +71,8 @@ jobs:
             while read VER; do
               apt download linux-headers-$VER:arm64 || echo "::error::Failed to download linux-headers-$VER:arm64"
               BASE_VERSION=$(echo "$VER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
-              COMMON_PKG=$(apt list -a "linux-headers-*-common-rpi:arm64" 2>/dev/null | grep "$BASE_VERSION" | head -n1 | awk -F/ '{print $1}')
-              if [ -n "$COMMON_PKG" ]; then
-                apt download "$COMMON_PKG:arm64" || echo "::error::Failed to download $COMMON_PKG:arm64"
-              else
-                echo "::error::Failed to find common headers for $VER"
-                exit 1
-              fi
+              COMMON_PKG="linux-headers-${BASE_VERSION}-common-rpi"
+              apt download "$COMMON_PKG:arm64" || echo "::error::Failed to download $COMMON_PKG:arm64"
             done < kernel_versions.txt
           fi
 
