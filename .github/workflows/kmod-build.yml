@@ -72,7 +72,8 @@ jobs:
             echo "$KERNEL_VERSION" > kernel_versions.txt
           else
             # Autodetect latest kernel_count versions using apt list
-            apt list -a 2>/dev/null | grep linux-headers | grep :$ARCH | grep -o '6\.[^ ]*' | sort -uV | tail -n $COUNT > kernel_versions.txt
+            # Match any major version, restrict to valid RPi kernel version patterns (e.g., 6.1.21+rpt, 7.0.0+rpt, etc)
+            apt list -a 2>/dev/null | grep linux-headers | grep :$ARCH | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?\+rpt[^ ]*' | sort -uV | tail -n $COUNT > kernel_versions.txt
             echo "Detected kernel versions:"; cat kernel_versions.txt
           fi
           echo "== Downloaded .deb files =="
