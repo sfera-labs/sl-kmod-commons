@@ -29,6 +29,11 @@ jobs:
         arch: ${{ fromJson(inputs.archs) }}
 
     steps:
+      - name: Show kmod-build.yml version
+        run: |
+          echo "::notice::kmod-build.yml version: 2026-04-30"
+          echo "::notice::Workflow file SHA: $(git rev-parse HEAD 2>/dev/null || echo 'not-a-git-repo')"
+
       - name: Checkout module repo
         uses: actions/checkout@v4
 
