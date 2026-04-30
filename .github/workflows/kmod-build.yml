@@ -122,7 +122,8 @@ jobs:
           mkdir root
           while read KVER; do
             HEADERS_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER*.deb | grep -v common | head -n1)
-            COMMON_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER-common-rpi*.deb | head -n1)
+            BASE_VERSION=$(echo "$KVER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
+            COMMON_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-${BASE_VERSION}-common-rpi*.deb | head -n1)
             if [ ! -s "$HEADERS_DEB" ] || [ ! -s "$COMMON_DEB" ]; then
               echo "❌ Downloaded headers deb not found or empty: $HEADERS_DEB $COMMON_DEB"
               echo "| $HEADERS_DEB $COMMON_DEB | ${{ matrix.arch }} | SKIP | download failed |" >> "$SUMMARY"
