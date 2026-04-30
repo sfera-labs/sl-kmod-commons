@@ -29,18 +29,6 @@ jobs:
         arch: ${{ fromJson(inputs.archs) }}
 
     steps:
-      - name: Show kmod-build.yml version
-        run: |
-          echo "::notice::kmod-build.yml version: 2026-04-30"
-          # Try to get the workflow source context from GitHub Actions env
-          echo "::notice::Workflow source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_REF/.*/main}/.github/workflows/kmod-build.yml"
-          # Show the commit SHA (short and long) if available
-          if [ -n "$GITHUB_SHA" ]; then
-            echo "::notice::Workflow commit SHA: ${GITHUB_SHA::7} ($GITHUB_SHA)"
-          else
-            echo "::notice::Workflow commit SHA: not-available"
-          fi
-
       - name: Checkout module repo
         uses: actions/checkout@v4
 
