@@ -57,8 +57,9 @@ jobs:
           COUNT=${{ inputs.kernel_count }}
           ARCH="${{ matrix.arch }}"
           if [ -n "$KERNEL_VERSION" ]; then
-            # Download only the specified version
+            # Download both arch-specific and common headers for the specified version
             apt download linux-headers-$KERNEL_VERSION:arm64 || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION:arm64" && exit 1)
+            apt download linux-headers-$KERNEL_VERSION-common-rpi:arm64 || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION-common-rpi:arm64" && exit 1)
             echo "$KERNEL_VERSION" > kernel_versions.txt
           else
             # Autodetect latest kernel_count versions using apt list
@@ -66,6 +67,7 @@ jobs:
             echo "Detected kernel versions:"; cat kernel_versions.txt
             while read VER; do
               apt download linux-headers-$VER:arm64 || echo "::error::Failed to download linux-headers-$VER:arm64"
+              apt download linux-headers-$VER-common-rpi:arm64 || echo "::error::Failed to download linux-headers-$VER-common-rpi:arm64"
             done < kernel_versions.txt
           fi
 
@@ -88,14 +90,15 @@ jobs:
           echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
           echo "|--------|------|--------|------|" >> "$SUMMARY"
 
-          # Clean up and extract the downloaded deb
+          # Clean up and extract the downloaded debs
           rm -rf root
           mkdir root
           while read KVER; do
-            HEADERS_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER*.deb | head -n1)
-            if [ ! -s "$HEADERS_DEB" ]; then
-              echo "❌ Downloaded headers deb not found or empty: $HEADERS_DEB"
-              echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | download failed |" >> "$SUMMARY"
+            HEADERS_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER*.deb | grep -v common | head -n1)
+            COMMON_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER-common-rpi*.deb | head -n1)
+            if [ ! -s "$HEADERS_DEB" ] || [ ! -s "$COMMON_DEB" ]; then
+              echo "❌ Downloaded headers deb not found or empty: $HEADERS_DEB $COMMON_DEB"
+              echo "| $HEADERS_DEB $COMMON_DEB | ${{ matrix.arch }} | SKIP | download failed |" >> "$SUMMARY"
               continue
             fi
             rm -rf root
@@ -105,11 +108,16 @@ jobs:
               echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | extract failed |" >> "$SUMMARY"
               continue
             fi
+            if ! dpkg-deb -x "$COMMON_DEB" root/; then
+              echo "❌ Failed to extract $COMMON_DEB"
+              echo "| $COMMON_DEB | ${{ matrix.arch }} | SKIP | extract failed |" >> "$SUMMARY"
+              continue
+            fi
 
             HDRDIR=$(ls root/usr/src | grep -m1 'linux-headers' || true)
             if [ -z "$HDRDIR" ]; then
-              echo "❌ No linux-headers directory found after extracting $HEADERS_DEB"
-              echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | no headers dir |" >> "$SUMMARY"
+              echo "❌ No linux-headers directory found after extracting $HEADERS_DEB and $COMMON_DEB"
+              echo "| $HEADERS_DEB $COMMON_DEB | ${{ matrix.arch }} | SKIP | no headers dir |" >> "$SUMMARY"
               continue
             fi
             KDIR="$GITHUB_WORKSPACE/root/usr/src/$HDRDIR"
