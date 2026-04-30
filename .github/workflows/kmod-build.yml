@@ -58,33 +58,25 @@ jobs:
           ARCH="${{ matrix.arch }}"
           if [ -n "$KERNEL_VERSION" ]; then
             # Download arch-specific headers
-            apt download linux-headers-$KERNEL_VERSION:arm64 || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION:arm64" && exit 1)
+            apt download linux-headers-$KERNEL_VERSION:$ARCH || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION:$ARCH" && exit 1)
             # Extract base version for common headers (e.g., 6.12.75+rpt)
             BASE_VERSION=$(echo "$KERNEL_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
             COMMON_PKG="linux-headers-${BASE_VERSION}-common-rpi"
-            # Try to download common headers for arm64, fallback to 'all' if not found
-            if ! apt download "$COMMON_PKG:arm64"; then
+            # Try to download common headers for arch, fallback to 'all' if not found
+            if ! apt download "$COMMON_PKG:$ARCH"; then
               echo "::notice::Falling back to $COMMON_PKG (arch: all)"
               if ! apt download "$COMMON_PKG"; then
-                echo "::error::Failed to download $COMMON_PKG:arm64 or $COMMON_PKG (all)" && exit 1
+                echo "::error::Failed to download $COMMON_PKG:$ARCH or $COMMON_PKG (all)" && exit 1
               fi
             fi
             echo "$KERNEL_VERSION" > kernel_versions.txt
           else
             # Autodetect latest kernel_count versions using apt list
-            apt list -a 2>/dev/null | grep linux-headers | grep :arm64 | grep -o '6\.[^ ]*' | sort -uV | tail -n $COUNT > kernel_versions.txt
+            apt list -a 2>/dev/null | grep linux-headers | grep :$ARCH | grep -o '6\.[^ ]*' | sort -uV | tail -n $COUNT > kernel_versions.txt
             echo "Detected kernel versions:"; cat kernel_versions.txt
-              while read KVER; do
-                HEADERS_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER*.deb | grep -v common | head -n1)
-                BASE_VERSION=$(echo "$KVER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
-                COMMON_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-${BASE_VERSION}-common-rpi*.deb | head -n1)
-                if [ ! -s "$HEADERS_DEB" ] || [ ! -s "$COMMON_DEB" ]; then
-                  echo "❌ Downloaded headers deb not found or empty: $HEADERS_DEB $COMMON_DEB"
-                  echo "| $HEADERS_DEB $COMMON_DEB | ${{ matrix.arch }} | SKIP | download failed |" >> "$SUMMARY"
-                  continue
-                fi
-            done < kernel_versions.txt
           fi
+          echo "== Downloaded .deb files =="
+          ls -lh $GITHUB_WORKSPACE/*.deb || echo "No debs found"
 
       - name: Set kernel versions for build
         id: kernels
@@ -114,9 +106,10 @@ jobs:
             HEADERS_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER*.deb | grep -v common | head -n1)
             BASE_VERSION=$(echo "$KVER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
             COMMON_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-${BASE_VERSION}-common-rpi*.deb | head -n1)
+            echo "Preparing to extract: $HEADERS_DEB and $COMMON_DEB"
             if [ ! -s "$HEADERS_DEB" ] || [ ! -s "$COMMON_DEB" ]; then
               echo "❌ Downloaded headers deb not found or empty: $HEADERS_DEB $COMMON_DEB"
-              echo "| $HEADERS_DEB $COMMON_DEB | ${{ matrix.arch }} | SKIP | download failed |" >> "$SUMMARY"
+              echo "| $HEADERS_DEB $COMMON_DEB | $ARCH | SKIP | download failed |" >> "$SUMMARY"
               continue
             fi
             rm -rf root
@@ -136,6 +129,10 @@ jobs:
               echo "| $COMMON_DEB | $ARCH | SKIP | extract failed |" >> "$SUMMARY"
               continue
             fi
+            echo "== After extraction, /usr/src contains =="
+            ls -lh root/usr/src || true
+            echo "== Disk usage of extracted headers =="
+            du -sh root/usr/src/* || true
 
             # Debug: list extracted src dirs and Makefiles
             echo "== Extracted /usr/src contents =="
@@ -161,13 +158,15 @@ jobs:
 
             echo "Headers version: $HDRDIR"
             echo "Build dir: $KDIR"
+            echo "Running: make -C $KDIR M=$PWD modules"
 
-            if make -C "$KDIR" M="$PWD" modules; then
+            if make -C "$KDIR" M="$PWD" modules 2>&1 | tee build.log; then
               echo "✅ Build OK"
               RESULT="OK"
               NOTE=""
             else
               echo "❌ Build failed"
+              echo "Last 20 lines of build.log:" && tail -20 build.log
               RESULT="FAIL"
               NOTE=""
               FAIL=1
@@ -184,9 +183,12 @@ jobs:
           done < kernel_versions.txt
 
           echo ""
+          OKS=$(grep -c '|.*|.*| OK |' "$SUMMARY" || true)
+          FAILS=$(grep -c '|.*|.*| FAIL |' "$SUMMARY" || true)
           echo "========== BUILD SUMMARY =========="
           cat "$SUMMARY"
           echo "=================================="
+          echo "Total builds: $((OKS+FAILS)), OK: $OKS, FAIL: $FAILS"
           exit $FAIL
 
       - name: Detect module name
