@@ -18,6 +18,10 @@ on:
         required: false
         type: string
         default: '.'
+      rpi_codename:
+        required: false
+        type: string
+        default: 'bookworm'
 
 jobs:
   build:
@@ -45,7 +49,8 @@ jobs:
 
       - name: Add Raspberry Pi OS repository and GPG key
         run: |
-          echo "deb http://archive.raspberrypi.org/debian/ bookworm main" | sudo tee /etc/apt/sources.list.d/raspi.list
+          CODENAME="${{ inputs.rpi_codename }}"
+          echo "deb http://archive.raspberrypi.org/debian/ $CODENAME main" | sudo tee /etc/apt/sources.list.d/raspi.list
           curl -fsSL https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/raspberrypi.gpg
           sudo apt-get update --allow-releaseinfo-change || true
 
