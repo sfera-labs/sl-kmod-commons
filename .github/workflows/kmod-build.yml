@@ -74,11 +74,15 @@ jobs:
             # Autodetect latest kernel_count versions using apt list
             apt list -a 2>/dev/null | grep linux-headers | grep :arm64 | grep -o '6\.[^ ]*' | sort -uV | tail -n $COUNT > kernel_versions.txt
             echo "Detected kernel versions:"; cat kernel_versions.txt
-            while read VER; do
-              apt download linux-headers-$VER:arm64 || echo "::error::Failed to download linux-headers-$VER:arm64"
-              BASE_VERSION=$(echo "$VER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
-              COMMON_PKG="linux-headers-${BASE_VERSION}-common-rpi"
-              apt download "$COMMON_PKG:arm64" || echo "::error::Failed to download $COMMON_PKG:arm64"
+              while read KVER; do
+                HEADERS_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER*.deb | grep -v common | head -n1)
+                BASE_VERSION=$(echo "$KVER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
+                COMMON_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-${BASE_VERSION}-common-rpi*.deb | head -n1)
+                if [ ! -s "$HEADERS_DEB" ] || [ ! -s "$COMMON_DEB" ]; then
+                  echo "❌ Downloaded headers deb not found or empty: $HEADERS_DEB $COMMON_DEB"
+                  echo "| $HEADERS_DEB $COMMON_DEB | ${{ matrix.arch }} | SKIP | download failed |" >> "$SUMMARY"
+                  continue
+                fi
             done < kernel_versions.txt
           fi
 
