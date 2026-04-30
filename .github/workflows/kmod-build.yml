@@ -142,10 +142,12 @@ jobs:
               continue
             fi
 
-            HDRDIR=$(ls root/usr/src | grep -m1 'linux-headers' || true)
+
+            # Always use the arch/flavor-specific headers directory for building
+            HDRDIR=$(ls root/usr/src | grep "linux-headers-$KVER" || true)
             if [ -z "$HDRDIR" ]; then
-              echo "❌ No linux-headers directory found after extracting $HEADERS_DEB and $COMMON_DEB"
-              echo "| $HEADERS_DEB $COMMON_DEB | ${{ matrix.arch }} | SKIP | no headers dir |" >> "$SUMMARY"
+              echo "❌ Arch/flavor-specific linux-headers directory not found after extracting $HEADERS_DEB and $COMMON_DEB"
+              echo "| $HEADERS_DEB $COMMON_DEB | ${{ matrix.arch }} | SKIP | no specific headers dir |" >> "$SUMMARY"
               continue
             fi
             KDIR="$GITHUB_WORKSPACE/root/usr/src/$HDRDIR"
