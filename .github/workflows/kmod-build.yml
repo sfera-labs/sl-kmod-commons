@@ -62,7 +62,13 @@ jobs:
             # Extract base version for common headers (e.g., 6.12.75+rpt)
             BASE_VERSION=$(echo "$KERNEL_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
             COMMON_PKG="linux-headers-${BASE_VERSION}-common-rpi"
-            apt download "$COMMON_PKG:arm64" || (echo "::error::Failed to download $COMMON_PKG:arm64" && exit 1)
+            # Try to download common headers for arm64, fallback to 'all' if not found
+            if ! apt download "$COMMON_PKG:arm64"; then
+              echo "::notice::Falling back to $COMMON_PKG (arch: all)"
+              if ! apt download "$COMMON_PKG"; then
+                echo "::error::Failed to download $COMMON_PKG:arm64 or $COMMON_PKG (all)" && exit 1
+              fi
+            fi
             echo "$KERNEL_VERSION" > kernel_versions.txt
           else
             # Autodetect latest kernel_count versions using apt list
