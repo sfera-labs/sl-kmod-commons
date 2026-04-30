@@ -102,12 +102,14 @@ jobs:
 
           FAIL=0
           SUMMARY="$GITHUB_WORKSPACE/summary.txt"
+          ARCH="${{ matrix.arch }}"
           echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
           echo "|--------|------|--------|------|" >> "$SUMMARY"
 
-          # Clean up and extract the downloaded debs
+          # Clean up and create extraction root ONCE per build
           rm -rf root
           mkdir root
+
           while read KVER; do
             HEADERS_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER*.deb | grep -v common | head -n1)
             BASE_VERSION=$(echo "$KVER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
@@ -124,18 +126,35 @@ jobs:
               echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | extract failed |" >> "$SUMMARY"
               continue
             fi
+            if ! dpkg-deb -x "$HEADERS_DEB" root/; then
+              echo "❌ Failed to extract $HEADERS_DEB"
+              echo "| $HEADERS_DEB | $ARCH | SKIP | extract failed |" >> "$SUMMARY"
+              continue
+            fi
             if ! dpkg-deb -x "$COMMON_DEB" root/; then
               echo "❌ Failed to extract $COMMON_DEB"
-              echo "| $COMMON_DEB | ${{ matrix.arch }} | SKIP | extract failed |" >> "$SUMMARY"
+              echo "| $COMMON_DEB | $ARCH | SKIP | extract failed |" >> "$SUMMARY"
               continue
             fi
 
+            # Debug: list extracted src dirs and Makefiles
+            echo "== Extracted /usr/src contents =="
+            ls -l root/usr/src || true
+            echo "== Find Makefile under root/ =="
+            find root/ -name Makefile || true
+
+            # Check for common headers directory
+            if [ ! -d "root/usr/src/linux-headers-${BASE_VERSION}-common-rpi" ]; then
+              echo "❌ Common headers directory missing after extraction!"
+              echo "| $HEADERS_DEB $COMMON_DEB | $ARCH | SKIP | no common headers dir |" >> "$SUMMARY"
+              continue
+            fi
 
             # Always use the arch/flavor-specific headers directory for building
             HDRDIR=$(ls root/usr/src | grep "linux-headers-$KVER" || true)
             if [ -z "$HDRDIR" ]; then
               echo "❌ Arch/flavor-specific linux-headers directory not found after extracting $HEADERS_DEB and $COMMON_DEB"
-              echo "| $HEADERS_DEB $COMMON_DEB | ${{ matrix.arch }} | SKIP | no specific headers dir |" >> "$SUMMARY"
+              echo "| $HEADERS_DEB $COMMON_DEB | $ARCH | SKIP | no specific headers dir |" >> "$SUMMARY"
               continue
             fi
             KDIR="$GITHUB_WORKSPACE/root/usr/src/$HDRDIR"
@@ -154,10 +173,10 @@ jobs:
               FAIL=1
             fi
 
-            echo "| $HDRDIR | ${{ matrix.arch }} | $RESULT | $NOTE |" >> "$SUMMARY"
+            echo "| $HDRDIR | $ARCH | $RESULT | $NOTE |" >> "$SUMMARY"
 
             if [ "$RESULT" = "OK" ]; then
-              OUT="$GITHUB_WORKSPACE/artifacts/${{ matrix.arch }}/$HDRDIR"
+              OUT="$GITHUB_WORKSPACE/artifacts/$ARCH/$HDRDIR"
               mkdir -p "$OUT"
               cp -v ./*.ko "$OUT/" 2>/dev/null || true
               cp -v ./*.dtbo "$OUT/" 2>/dev/null || true
