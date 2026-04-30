@@ -39,7 +39,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y build-essential jq curl xz-utils gnupg
+          # Install build tools and cross-compilers for both 64-bit and 32-bit Pi
+          sudo apt install -y build-essential jq curl xz-utils gnupg gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
 
       - name: Enable arm64 architecture for apt
         run: |
@@ -151,6 +152,14 @@ jobs:
               echo "❌ Common headers directory missing after extraction!"
               echo "| $HEADERS_DEB $COMMON_DEB | $ARCH | SKIP | no common headers dir |" >> "$SUMMARY"
               continue
+            fi
+
+            # Workaround: create empty Makefile.extrawarn if missing (RPi headers bug)
+            EXTRAWARN="root/usr/src/linux-headers-${BASE_VERSION}-common-rpi/scripts/Makefile.extrawarn"
+            if [ ! -f "$EXTRAWARN" ]; then
+              echo "::warning::Missing Makefile.extrawarn, creating empty file to unblock build"
+              mkdir -p "$(dirname "$EXTRAWARN")"
+              touch "$EXTRAWARN"
             fi
 
             # Always use the arch/flavor-specific headers directory for building
