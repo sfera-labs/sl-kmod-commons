@@ -158,7 +158,7 @@ jobs:
             EXTRAWARN="root/usr/src/linux-headers-${BASE_VERSION}-common-rpi/scripts/Makefile.extrawarn"
             if [ ! -f "$EXTRAWARN" ]; then
               echo "::warning::Missing Makefile.extrawarn, creating empty file to unblock build"
-              mkdir -p "$(dirname "$EXTRAWARN")"
+              mkdir -p "$(dirname "$EXTRAWARN")" 2>/dev/null || true
               touch "$EXTRAWARN"
             fi
 
