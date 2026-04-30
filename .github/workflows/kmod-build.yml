@@ -160,13 +160,12 @@ jobs:
             echo "Build dir: $KDIR"
             echo "Running: make -C $KDIR M=$PWD modules"
 
-            if make -C "$KDIR" M="$PWD" modules 2>&1 | tee build.log; then
+            if make -C "$KDIR" M="$PWD" modules; then
               echo "✅ Build OK"
               RESULT="OK"
               NOTE=""
             else
               echo "❌ Build failed"
-              echo "Last 20 lines of build.log:" && tail -20 build.log
               RESULT="FAIL"
               NOTE=""
               FAIL=1
