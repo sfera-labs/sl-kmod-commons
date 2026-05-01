@@ -3,14 +3,15 @@ name: "Kernel Module build test"
 on:
   workflow_call:
     inputs:
-      archs:
-        required: true
-        type: string
-      kernel_count:
+      newest_lines_count:
         required: false
         type: number
-        default: 3
-      kernel_version:
+        default: 1
+      release_lines:
+        required: false
+        type: string
+        default: ''
+      kernel_versions:
         required: false
         type: string
         default: ''
@@ -27,11 +28,6 @@ jobs:
   build:
     runs-on: ubuntu-24.04-arm
 
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: ${{ fromJson(inputs.archs) }}
-
     steps:
       - name: Checkout module repo
         uses: actions/checkout@v5
@@ -39,51 +35,19 @@ jobs:
       - name: Install dependencies
         run: |
           set -e
-          HOST_ARCH="$(dpkg --print-architecture)"
-          ARCHS='${{ inputs.archs }}'
-          echo "Runner host architecture: $HOST_ARCH"
-          echo "Requested build arch matrix: $ARCHS"
+          echo "Runner host architecture: $(dpkg --print-architecture)"
           sudo apt update
           # Base tools and native compiler
           sudo apt install -y build-essential jq curl xz-utils gnupg gcc-12 device-tree-compiler
+          # Keep armhf cross toolchain available for targets inferred as 32-bit ARM.
+          sudo apt install -y gcc-12-arm-linux-gnueabihf
 
-          # Cross toolchain for arm64 is needed only on non-arm64 hosts.
-          if echo "$ARCHS" | grep -q '"arm64"'; then
-            if [ "$HOST_ARCH" != "arm64" ]; then
-              sudo apt install -y gcc-12-aarch64-linux-gnu
-            else
-              echo "arm64 target on arm64 host: using native gcc-12 (no aarch64 cross compiler required)"
-            fi
-          fi
-
-          # Cross toolchain for 32-bit ARM targets.
-          if echo "$ARCHS" | grep -Eq '"armhf"|"arm"'; then
-            sudo apt install -y gcc-12-arm-linux-gnueabihf
-          fi
-
-      - name: Enable arm64 architecture for apt
+      - name: Enable package architectures for apt
         run: |
           set -e
-          HOST_ARCH="$(dpkg --print-architecture)"
-          ARCHS='${{ inputs.archs }}'
-          ONLY_ARM64="$(echo "$ARCHS" | jq -r 'length == 1 and .[0] == "arm64"')"
-          NEED_ARMHF="$(echo "$ARCHS" | jq -r 'map(select(. == "armhf" or . == "arm")) | length > 0')"
-
-          # Optimization: on arm64 runner with arm64-only matrix, adding arm64 is redundant.
-          if [ "$HOST_ARCH" = "arm64" ] && [ "$ONLY_ARM64" = "true" ]; then
-            echo "Skipping dpkg --add-architecture arm64: host is arm64 and matrix is arm64-only"
-          else
-            echo "Enabling arm64 foreign architecture for apt (host=$HOST_ARCH, matrix=$ARCHS)"
-            sudo dpkg --add-architecture arm64
-          fi
-
-          # Enable armhf when 32-bit ARM targets are requested.
-          if [ "$NEED_ARMHF" = "true" ] && [ "$HOST_ARCH" != "armhf" ]; then
-            echo "Enabling armhf foreign architecture for apt (host=$HOST_ARCH, matrix=$ARCHS)"
-            sudo dpkg --add-architecture armhf
-          fi
-
-          # Keep update tolerant because third-party mirrors can transiently miss some indexes.
+          # Enable both package architectures so target architecture can be inferred from package metadata.
+          sudo dpkg --add-architecture arm64
+          sudo dpkg --add-architecture armhf
           sudo apt-get update --allow-releaseinfo-change || true
 
       - name: Add Raspberry Pi OS repository and GPG key
@@ -97,87 +61,172 @@ jobs:
         id: download_headers
         run: |
           set -e
-          KERNEL_VERSION="${{ inputs.kernel_version }}"
-          COUNT=${{ inputs.kernel_count }}
-          ARCH="${{ matrix.arch }}"
+          EXPLICIT_VERSIONS="${{ inputs.kernel_versions }}"
+          EXPLICIT_LINES="${{ inputs.release_lines }}"
+          NEWEST_LINES_COUNT="${{ inputs.newest_lines_count }}"
           HOST_ARCH="$(dpkg --print-architecture)"
-          SUMMARY="$GITHUB_WORKSPACE/summary.txt"
-
-          # Map matrix arch to Debian apt architecture names used by packages.
-          case "$ARCH" in
-            arm64)
-              APT_ARCH="arm64"
-              ;;
-            armhf|arm)
-              APT_ARCH="armhf"
-              ;;
-            *)
-              REASON="Unsupported target arch '$ARCH' (supported: arm64, armhf, arm)"
-              echo "WARN|SKIP|arch=$ARCH|kernel=${KERNEL_VERSION:-auto}|reason=$REASON" > "$SUMMARY"
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
-              echo "skip_arch=$ARCH" >> "$GITHUB_OUTPUT"
-              echo "skip_kernel=${KERNEL_VERSION:-auto}" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-          esac
 
           echo "Host architecture: $HOST_ARCH"
-          echo "Target architecture: $ARCH"
-          echo "APT package architecture: $APT_ARCH"
+          echo "Selection inputs: newest_lines_count=$NEWEST_LINES_COUNT release_lines='${EXPLICIT_LINES:-}' kernel_versions='${EXPLICIT_VERSIONS:-}'"
 
-          if [ -n "$KERNEL_VERSION" ]; then
-            # Validate common flavor mismatches early for clearer failures.
-            if [ "$APT_ARCH" = "armhf" ] && echo "$KERNEL_VERSION" | grep -Eq -- '-rpi-v8$|-rpi-2712$'; then
-              REASON="architecture '$ARCH' and kernel_version '$KERNEL_VERSION' do not match"
-              echo "WARN|SKIP|arch=$ARCH|kernel=$KERNEL_VERSION|reason=$REASON" > "$SUMMARY"
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
-              echo "skip_arch=$ARCH" >> "$GITHUB_OUTPUT"
-              echo "skip_kernel=$KERNEL_VERSION" >> "$GITHUB_OUTPUT"
-              exit 0
+          rm -f candidates.txt selected_targets.txt kernel_targets.txt
+
+          # Collect candidate header packages from both Raspberry Pi and Ubuntu raspi flavors.
+          apt list -a 2>/dev/null | awk -F/ '
+            /^linux-headers-[0-9]/ {
+              pkg=$1
+              sub(/^linux-headers-/, "", pkg)
+              arch=$NF
+              if (pkg !~ /^[0-9]+\.[0-9]+\.[0-9]+/) next
+
+              family=""
+              if (pkg ~ /\+rpt-/) {
+                family="rpi"
+              } else if (pkg ~ /-raspi([-.].*)?$/) {
+                family="ubuntu"
+              } else {
+                next
+              }
+
+              core=pkg
+              sub(/^([0-9]+\.[0-9]+\.[0-9]+).*/, "\\1", core)
+              line=core
+              sub(/^([0-9]+\.[0-9]+).*/, "\\1", line)
+              print pkg "|" arch "|linux-headers-" pkg "|" family "|" core "|" line
+            }
+          ' | sort -u > candidates.txt
+
+          if [ ! -s candidates.txt ]; then
+            REASON="no kernel headers were discovered in apt metadata"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          add_selection_by_core() {
+            local core="$1"
+            if [ -n "$core" ]; then
+              awk -F'|' -v c="$core" '$5 == c { print }' candidates.txt >> selected_targets.txt
+            fi
+          }
+
+          : > selected_targets.txt
+
+          if [ -n "$EXPLICIT_VERSIONS" ]; then
+            echo "Selection mode: explicit versions"
+            TOKENS=$(echo "$EXPLICIT_VERSIONS" | tr ',' ' ')
+            for token in $TOKENS; do
+              token="$(echo "$token" | xargs)"
+              [ -z "$token" ] && continue
+              if echo "$token" | grep -Eq '[+-]'; then
+                # Full kernel flavor token such as 6.12.75+rpt-rpi-v8.
+                awk -F'|' -v t="$token" '$1 == t { print }' candidates.txt >> selected_targets.txt
+              elif echo "$token" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                # Explicit core version such as 6.12.75.
+                add_selection_by_core "$token"
+              else
+                echo "::warning::Ignoring invalid kernel_versions token '$token'"
+              fi
+            done
+          elif [ -n "$EXPLICIT_LINES" ]; then
+            echo "Selection mode: explicit release lines"
+            TOKENS=$(echo "$EXPLICIT_LINES" | tr ',' ' ')
+            for line in $TOKENS; do
+              line="$(echo "$line" | xargs)"
+              [ -z "$line" ] && continue
+              latest_core=$(awk -F'|' -v l="$line" '$6 == l { print $5 }' candidates.txt | sort -uV | tail -n 1 || true)
+              if [ -z "$latest_core" ]; then
+                echo "::warning::No kernel release matched line '$line'"
+                continue
+              fi
+              add_selection_by_core "$latest_core"
+            done
+          else
+            echo "Selection mode: newest release lines"
+            LINES=$(awk -F'|' '{ print $6 }' candidates.txt | sort -uV)
+            NEWEST_LINES=$(echo "$LINES" | tail -n "$NEWEST_LINES_COUNT")
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              latest_core=$(awk -F'|' -v l="$line" '$6 == l { print $5 }' candidates.txt | sort -uV | tail -n 1 || true)
+              [ -z "$latest_core" ] && continue
+              add_selection_by_core "$latest_core"
+            done <<< "$NEWEST_LINES"
+          fi
+
+          sort -u selected_targets.txt -o selected_targets.txt
+
+          if [ ! -s selected_targets.txt ]; then
+            REASON="kernel selection produced no targets"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Selected kernel targets (kver|arch|pkg|family|core|line):"
+          cat selected_targets.txt
+
+          while IFS='|' read -r KVER APT_ARCH HEADER_PKG FAMILY CORE LINE; do
+            [ -z "$KVER" ] && continue
+
+            if ! apt download "$HEADER_PKG:$APT_ARCH" >/dev/null 2>&1; then
+              echo "::warning::Skipping kernel '$KVER': cannot download headers package '$HEADER_PKG:$APT_ARCH'"
+              continue
             fi
 
-            # Download arch-specific headers
-            apt download linux-headers-$KERNEL_VERSION:$APT_ARCH || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION:$APT_ARCH (matrix arch=$ARCH)" && exit 1)
-            # Extract base version for common headers (e.g., 6.12.75+rpt)
-            BASE_VERSION=$(echo "$KERNEL_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
-            COMMON_PKG="linux-headers-${BASE_VERSION}-common-rpi"
-            KBUILD_PKG="linux-kbuild-${BASE_VERSION}"
-            # Try to download common headers for arch, fallback to 'all' if not found
-            if ! apt download "$COMMON_PKG:$APT_ARCH"; then
-              echo "::notice::Falling back to $COMMON_PKG (arch: all)"
-              if ! apt download "$COMMON_PKG"; then
-                echo "::error::Failed to download $COMMON_PKG:$APT_ARCH or $COMMON_PKG (all)" && exit 1
+            if [ "$FAMILY" = "rpi" ]; then
+              BASE_RPT=$(echo "$KVER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt' || true)
+              if [ -z "$BASE_RPT" ]; then
+                echo "::warning::Skipping kernel '$KVER': failed to derive +rpt base version"
+                continue
+              fi
+
+              COMMON_PKG="linux-headers-${BASE_RPT}-common-rpi"
+              if ! apt download "$COMMON_PKG:$APT_ARCH" >/dev/null 2>&1; then
+                if ! apt download "$COMMON_PKG" >/dev/null 2>&1; then
+                  echo "::warning::Skipping kernel '$KVER': missing common headers package '$COMMON_PKG'"
+                  continue
+                fi
+              fi
+
+              KBUILD_PKG="linux-kbuild-${BASE_RPT}"
+              if ! apt download "$KBUILD_PKG:$HOST_ARCH" >/dev/null 2>&1; then
+                if ! apt download "$KBUILD_PKG" >/dev/null 2>&1; then
+                  echo "::warning::Skipping kernel '$KVER': missing host kbuild package '$KBUILD_PKG'"
+                  continue
+                fi
+              fi
+            else
+              # Ubuntu raspi packages usually use linux-kbuild-<major.minor>.
+              KBUILD_PKG="linux-kbuild-${LINE}"
+              if ! apt download "$KBUILD_PKG:$HOST_ARCH" >/dev/null 2>&1; then
+                if ! apt download "$KBUILD_PKG" >/dev/null 2>&1; then
+                  echo "::warning::Kernel '$KVER': host kbuild package '$KBUILD_PKG' not found; continuing"
+                fi
               fi
             fi
-            # Download kbuild tools for the HOST architecture (fixdep runs on the CI runner).
-            # Never force target-arch kbuild here, because fixdep is executed on the runner host.
-            if ! apt download "$KBUILD_PKG:$HOST_ARCH"; then
-              echo "::notice::Host-arch kbuild not found as $KBUILD_PKG:$HOST_ARCH, trying unqualified package"
-              apt download "$KBUILD_PKG" || (echo "::error::Failed to download $KBUILD_PKG for host architecture $HOST_ARCH" && exit 1)
+
+            if ! echo "$KVER|$APT_ARCH|$HEADER_PKG|$FAMILY|$CORE|$LINE" >> kernel_targets.txt; then
+              echo "::warning::Skipping kernel '$KVER': failed to add target record"
+              continue
             fi
-            echo "$KERNEL_VERSION" > kernel_versions.txt
-          else
-            # Autodetect latest kernel_count versions using apt list
-            # Match any major version, restrict to valid RPi kernel version patterns (e.g., 6.1.21+rpt, 7.0.0+rpt, etc)
-            apt list -a 2>/dev/null | grep linux-headers | grep :$APT_ARCH | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?\+rpt[^ ]*' | sort -uV | tail -n $COUNT > kernel_versions.txt
-            echo "Detected kernel versions:"; cat kernel_versions.txt
+          done < selected_targets.txt
+
+          if [ ! -s kernel_targets.txt ]; then
+            REASON="no kernels passed package download checks"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          sort -u kernel_targets.txt -o kernel_targets.txt
+
+          echo "Selected build targets (kver|arch|pkg|family|core|line):"
+          cat kernel_targets.txt
+
           echo "== Downloaded .deb files =="
-          ls -lh $GITHUB_WORKSPACE/*.deb || echo "No debs found"
+          ls -lh "$GITHUB_WORKSPACE"/*.deb || echo "No debs found"
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "skip_reason=" >> "$GITHUB_OUTPUT"
-          echo "skip_arch=$ARCH" >> "$GITHUB_OUTPUT"
-          echo "skip_kernel=${KERNEL_VERSION:-auto}" >> "$GITHUB_OUTPUT"
-
-      - name: Set kernel versions for build
-        id: kernels
-        if: steps.download_headers.outputs.skip != 'true'
-        run: |
-          set -e
-          cat kernel_versions.txt | jq -R . | jq -s -c . > kernel_versions.json
-          echo "kernels=$(cat kernel_versions.json)" >> $GITHUB_OUTPUT
 
       - name: Build against kernels
         id: build
@@ -188,68 +237,90 @@ jobs:
           set -euo pipefail
 
           FAIL=0
-          SUMMARY="$GITHUB_WORKSPACE/summary.txt"
-          ARCH="${{ matrix.arch }}"
           HOST_ARCH="$(dpkg --print-architecture)"
           echo "Runner host architecture in build step: $HOST_ARCH"
-          : > "$SUMMARY"
+          OKS=0
+          FAILS=0
+          SKIPS=0
+          TARGETS=0
 
           # Clean up and create extraction root ONCE per build
           rm -rf root
           mkdir root
 
-          while read KVER; do
-            HEADERS_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER*.deb | grep -v common | head -n1)
-            BASE_VERSION=$(echo "$KVER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
-            COMMON_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-${BASE_VERSION}-common-rpi*.deb | head -n1)
-            KBUILD_DEB=$(ls $GITHUB_WORKSPACE/linux-kbuild-${BASE_VERSION}*.deb | grep -E "_(${HOST_ARCH}|all)\.deb$" | head -n1 || true)
-            if [ -z "$KBUILD_DEB" ]; then
-              KBUILD_DEB=$(ls $GITHUB_WORKSPACE/linux-kbuild-${BASE_VERSION}*.deb | head -n1)
-              echo "::warning::No host-matching kbuild .deb found; tentatively selected $KBUILD_DEB"
-            fi
-            echo "Preparing to extract: $HEADERS_DEB, $COMMON_DEB and $KBUILD_DEB"
-            if [ ! -s "$HEADERS_DEB" ] || [ ! -s "$COMMON_DEB" ] || [ ! -s "$KBUILD_DEB" ]; then
-              echo "❌ Downloaded package deb not found or empty: $HEADERS_DEB $COMMON_DEB $KBUILD_DEB"
-              echo "WARN|SKIP|arch=$ARCH|kernel=$KVER|reason=download failed" >> "$SUMMARY"
+          while IFS='|' read -r KVER APT_ARCH HEADER_PKG FAMILY CORE LINE; do
+            [ -z "$KVER" ] && continue
+            TARGETS=$((TARGETS + 1))
+
+            HEADERS_DEB=$(ls "$GITHUB_WORKSPACE"/${HEADER_PKG}_*.deb | grep -E "_${APT_ARCH}\.deb$" | head -n1 || true)
+            if [ -z "$HEADERS_DEB" ] || [ ! -s "$HEADERS_DEB" ]; then
+              echo "::warning::Skipping kernel $KVER: missing downloaded headers deb"
+              SKIPS=$((SKIPS + 1))
               continue
             fi
+
+            COMMON_DEB=""
+            BASE_RPT=""
+            if [ "$FAMILY" = "rpi" ]; then
+              BASE_RPT=$(echo "$KVER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt' || true)
+              COMMON_DEB=$(ls "$GITHUB_WORKSPACE"/linux-headers-${BASE_RPT}-common-rpi*.deb | grep -E "_(${APT_ARCH}|all)\.deb$" | head -n1 || true)
+              if [ -z "$COMMON_DEB" ] || [ ! -s "$COMMON_DEB" ]; then
+                echo "::warning::Skipping kernel $KVER: missing common headers deb"
+                SKIPS=$((SKIPS + 1))
+                continue
+              fi
+            fi
+
+            KBUILD_DEB=""
+            if [ "$FAMILY" = "rpi" ] && [ -n "$BASE_RPT" ]; then
+              KBUILD_DEB=$(ls "$GITHUB_WORKSPACE"/linux-kbuild-${BASE_RPT}*.deb | grep -E "_(${HOST_ARCH}|all)\.deb$" | head -n1 || true)
+            else
+              KBUILD_DEB=$(ls "$GITHUB_WORKSPACE"/linux-kbuild-${LINE}*.deb | grep -E "_(${HOST_ARCH}|all)\.deb$" | head -n1 || true)
+            fi
+            if [ -z "$KBUILD_DEB" ] || [ ! -s "$KBUILD_DEB" ]; then
+              echo "::warning::Skipping kernel $KVER: missing host kbuild deb"
+              SKIPS=$((SKIPS + 1))
+              continue
+            fi
+
+            echo "Preparing to extract: $HEADERS_DEB ${COMMON_DEB:-<none>} $KBUILD_DEB"
 
             KBUILD_DEB_ARCH="$(dpkg-deb -f "$KBUILD_DEB" Architecture || true)"
             echo "Selected kbuild deb architecture: ${KBUILD_DEB_ARCH:-unknown} (host: $HOST_ARCH)"
             if [ "$KBUILD_DEB_ARCH" != "$HOST_ARCH" ] && [ "$KBUILD_DEB_ARCH" != "all" ]; then
-              echo "❌ Selected kbuild .deb arch ($KBUILD_DEB_ARCH) does not match host arch ($HOST_ARCH)"
-              echo "ERROR|FAIL|arch=$ARCH|kernel=$KVER|reason=kbuild arch mismatch host=$HOST_ARCH pkg=$KBUILD_DEB_ARCH" >> "$SUMMARY"
+              echo "::error::Kernel $KVER failed: kbuild package architecture does not match host"
               FAIL=1
+              FAILS=$((FAILS + 1))
               continue
             fi
+
             rm -rf root
             mkdir root
             if ! dpkg-deb -x "$HEADERS_DEB" root/; then
-              echo "❌ Failed to extract $HEADERS_DEB"
-              echo "WARN|SKIP|arch=${{ matrix.arch }}|kernel=$KVER|reason=extract failed ($HEADERS_DEB)" >> "$SUMMARY"
+              echo "::warning::Skipping kernel $KVER: failed to extract headers"
+              SKIPS=$((SKIPS + 1))
               continue
             fi
-            if ! dpkg-deb -x "$COMMON_DEB" root/; then
-              echo "❌ Failed to extract $COMMON_DEB"
-              echo "WARN|SKIP|arch=$ARCH|kernel=$KVER|reason=extract failed ($COMMON_DEB)" >> "$SUMMARY"
+            if [ -n "$COMMON_DEB" ] && ! dpkg-deb -x "$COMMON_DEB" root/; then
+              echo "::warning::Skipping kernel $KVER: failed to extract common headers"
+              SKIPS=$((SKIPS + 1))
               continue
             fi
             if ! dpkg-deb -x "$KBUILD_DEB" root/; then
-              echo "❌ Failed to extract $KBUILD_DEB"
-              echo "WARN|SKIP|arch=$ARCH|kernel=$KVER|reason=extract failed ($KBUILD_DEB)" >> "$SUMMARY"
+              echo "::warning::Skipping kernel $KVER: failed to extract kbuild"
+              SKIPS=$((SKIPS + 1))
               continue
             fi
 
             echo "== Package architecture metadata =="
             dpkg-deb -f "$HEADERS_DEB" Package Version Architecture || true
-            dpkg-deb -f "$COMMON_DEB" Package Version Architecture || true
+            [ -n "$COMMON_DEB" ] && dpkg-deb -f "$COMMON_DEB" Package Version Architecture || true
             dpkg-deb -f "$KBUILD_DEB" Package Version Architecture || true
             echo "== After extraction, /usr/src contains =="
             ls -lh root/usr/src || true
             echo "== Disk usage of extracted headers =="
             du -sh root/usr/src/* || true
 
-            # Debug: list extracted src dirs and Makefiles
             echo "== Extracted /usr/src contents =="
             ls -l root/usr/src || true
             echo "== Find Makefile under root/ =="
@@ -258,8 +329,8 @@ jobs:
             uname -m || true
             dpkg --print-architecture || true
 
-            # Determine cross-compile tuple from matrix arch
-            case "$ARCH" in
+            # Infer kernel architecture from package metadata.
+            case "$APT_ARCH" in
               arm64)
                 if [ "$HOST_ARCH" = "arm64" ]; then
                   CROSS_COMPILE=""
@@ -268,29 +339,27 @@ jobs:
                 fi
                 KARCH="arm64"
                 ;;
-              armhf|arm)
+              armhf)
                 CROSS_COMPILE="arm-linux-gnueabihf-"
                 KARCH="arm"
                 ;;
               *)
-                echo "::warning::Unknown target arch '$ARCH', leaving CROSS_COMPILE empty"
-                CROSS_COMPILE=""
-                KARCH="$ARCH"
-                ;;
-            esac
-
-            # Check for common headers directory
-            if [ ! -d "root/usr/src/linux-headers-${BASE_VERSION}-common-rpi" ]; then
-              echo "❌ Common headers directory missing after extraction!"
-              echo "WARN|SKIP|arch=$ARCH|kernel=$KVER|reason=no common headers dir" >> "$SUMMARY"
-              continue
+                echo "::warning::Skipping kernel $KVER: unsupported inferred package architecture '$APT_ARCH'"
+                SKIPS=$((SKIPS + 1))
+                continue
+              fi
             fi
 
             # Always use the arch/flavor-specific headers directory for building
-            HDRDIR=$(ls root/usr/src | grep "linux-headers-$KVER" || true)
+            HDRDIR=""
+            if [ -d "root/usr/src/$HEADER_PKG" ]; then
+              HDRDIR="$HEADER_PKG"
+            else
+              HDRDIR=$(ls root/usr/src | grep "linux-headers-$KVER" | head -n1 || true)
+            fi
             if [ -z "$HDRDIR" ]; then
-              echo "❌ Arch/flavor-specific linux-headers directory not found after extracting $HEADERS_DEB and $COMMON_DEB"
-              echo "WARN|SKIP|arch=$ARCH|kernel=$KVER|reason=no specific headers dir" >> "$SUMMARY"
+              echo "::warning::Skipping kernel $KVER: specific headers directory missing"
+              SKIPS=$((SKIPS + 1))
               continue
             fi
             KDIR="$GITHUB_WORKSPACE/root/usr/src/$HDRDIR"
@@ -311,8 +380,13 @@ jobs:
             sudo ln -s "$KDIR" "/lib/modules/$KVER/build"
 
             echo "== Kbuild tools/debug =="
-            ls -l root/usr/src/linux-kbuild-${BASE_VERSION}/scripts/basic/fixdep || true
-            file root/usr/src/linux-kbuild-${BASE_VERSION}/scripts/basic/fixdep || true
+            FIXDEP_PATH=$(find root -path '*/scripts/basic/fixdep' | head -n1 || true)
+            if [ -n "$FIXDEP_PATH" ]; then
+              ls -l "$FIXDEP_PATH" || true
+              file "$FIXDEP_PATH" || true
+            else
+              echo "fixdep path not found under extracted tree"
+            fi
 
             if [ -n "$CROSS_COMPILE" ]; then
               CC_BIN="${CROSS_COMPILE}gcc-12"
@@ -321,9 +395,9 @@ jobs:
             fi
             echo "Selected compiler binary: $CC_BIN"
             if ! command -v "$CC_BIN" >/dev/null 2>&1; then
-              echo "❌ Compiler not found: $CC_BIN"
-              echo "ERROR|FAIL|arch=$ARCH|kernel=$KVER|reason=missing compiler $CC_BIN" >> "$SUMMARY"
+              echo "::error::Kernel $KVER failed: compiler not found ($CC_BIN)"
               FAIL=1
+              FAILS=$((FAILS + 1))
               continue
             fi
             "$CC_BIN" --version || true
@@ -337,6 +411,8 @@ jobs:
             export CROSS_COMPILE="$CROSS_COMPILE"
             export CC="$CC_BIN"
             export KVER="$KVER"
+            KO_COUNT=0
+            DTBO_COUNT=0
 
             # Keep clean non-fatal: first build on a fresh checkout may not have artifacts to clean.
             make clean || true
@@ -348,97 +424,68 @@ jobs:
 
               # Strict contract: both outputs are expected from local make flow.
               if [ "$KO_COUNT" -eq 0 ] || [ "$DTBO_COUNT" -eq 0 ]; then
-                echo "❌ Expected outputs missing after make (.ko and .dtbo are both required)"
-                RESULT="FAIL"
-                NOTE="missing expected artifacts: ko=$KO_COUNT dtbo=$DTBO_COUNT"
+                echo "::error::Kernel $KVER failed: expected .ko and .dtbo outputs are required"
                 FAIL=1
+                FAILS=$((FAILS + 1))
               else
-                echo "✅ Build OK"
-                RESULT="OK"
-                NOTE="ko+dtbo generated"
+                echo "Build OK for kernel $KVER"
+                OKS=$((OKS + 1))
               fi
             else
-              echo "❌ Build failed"
-              RESULT="FAIL"
-              NOTE="make failed"
+              echo "::error::Kernel $KVER failed: make returned non-zero"
               FAIL=1
+              FAILS=$((FAILS + 1))
             fi
 
-            if [ "$RESULT" = "OK" ]; then
-              echo "OK|PASS|arch=$ARCH|kernel=$KVER|reason=$NOTE" >> "$SUMMARY"
-            else
-              echo "ERROR|FAIL|arch=$ARCH|kernel=$KVER|reason=$NOTE" >> "$SUMMARY"
-            fi
-
-            if [ "$RESULT" = "OK" ]; then
-              OUT="$GITHUB_WORKSPACE/artifacts/$ARCH/module-artifacts-$KVER"
+            if [ "$KO_COUNT" -gt 0 ] && [ "$DTBO_COUNT" -gt 0 ]; then
+              OUT="$GITHUB_WORKSPACE/artifacts/$APT_ARCH/module-artifacts-$KVER"
               mkdir -p "$OUT"
               find . -maxdepth 1 -type f -name '*.ko' -print -exec cp -v {} "$OUT/" \;
               find . -maxdepth 1 -type f -name '*.dtbo' -print -exec cp -v {} "$OUT/" \;
             fi
-          done < kernel_versions.txt
+          done < "$GITHUB_WORKSPACE/kernel_targets.txt"
 
-          echo ""
-          OKS=$(grep -c '^OK|' "$SUMMARY" || true)
-          FAILS=$(grep -c '^ERROR|' "$SUMMARY" || true)
-          SKIPS=$(grep -c '^WARN|SKIP|' "$SUMMARY" || true)
-          echo "========== BUILD SUMMARY =========="
-          cat "$SUMMARY"
-          echo "=================================="
           echo "Total builds: $((OKS+FAILS+SKIPS)), OK: $OKS, SKIP: $SKIPS, FAIL: $FAILS"
+          echo "target_count=$TARGETS" >> "$GITHUB_OUTPUT"
+          echo "ok_count=$OKS" >> "$GITHUB_OUTPUT"
+          echo "skip_count=$SKIPS" >> "$GITHUB_OUTPUT"
+          echo "fail_count=$FAILS" >> "$GITHUB_OUTPUT"
           exit $FAIL
-
-      - name: Detect module name
-        if: steps.build.outcome == 'success'
-        working-directory: ${{ inputs.module_path }}
-        run: |
-          if [ ! -f MODULE_NAME ]; then
-            echo "MODULE_NAME file not found!" >&2
-            exit 1
-          fi
-          echo "MODULE_NAME=$(cat MODULE_NAME)" >> $GITHUB_ENV
 
       - name: Upload artifacts
         if: always() && steps.download_headers.outputs.skip != 'true'
         uses: actions/upload-artifact@v6
         with:
-          name: kmod-artifacts-${{ matrix.arch }}
-          path: artifacts/${{ matrix.arch }}/
+          name: kmod-artifacts
+          path: artifacts/
 
       - name: Show final status
         if: always()
         run: |
-          ARCH="${{ matrix.arch }}"
-          KERNEL_HINT="${{ inputs.kernel_version }}"
-          if [ -z "$KERNEL_HINT" ]; then
-            KERNEL_HINT="auto"
-          fi
-
           if [ "${{ steps.download_headers.outputs.skip }}" = "true" ]; then
-            echo "::warning::[SKIP][warning] arch=${{ steps.download_headers.outputs.skip_arch }} kernel=${{ steps.download_headers.outputs.skip_kernel }} reason=${{ steps.download_headers.outputs.skip_reason }}"
+            echo "::warning::SKIP: ${{ steps.download_headers.outputs.skip_reason }}"
             exit 0
           fi
 
-          SUMMARY="$GITHUB_WORKSPACE/summary.txt"
-          if [ ! -f "$SUMMARY" ]; then
-            echo "::notice::[INFO][info] arch=$ARCH kernel=$KERNEL_HINT no summary generated"
-            exit 0
-          fi
-
-          OKS=$(grep -c '^OK|' "$SUMMARY" || true)
-          FAILS=$(grep -c '^ERROR|' "$SUMMARY" || true)
-          SKIPS=$(grep -c '^WARN|SKIP|' "$SUMMARY" || true)
+          TARGETS="${{ steps.build.outputs.target_count }}"
+          OKS="${{ steps.build.outputs.ok_count }}"
+          SKIPS="${{ steps.build.outputs.skip_count }}"
+          FAILS="${{ steps.build.outputs.fail_count }}"
+          [ -z "$TARGETS" ] && TARGETS=0
+          [ -z "$OKS" ] && OKS=0
+          [ -z "$SKIPS" ] && SKIPS=0
+          [ -z "$FAILS" ] && FAILS=0
 
           if [ "$FAILS" -gt 0 ]; then
-            echo "::error::[FAIL][negative] arch=$ARCH kernel=$KERNEL_HINT ok=$OKS skip=$SKIPS fail=$FAILS"
+            echo "::error::FAIL: targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS"
           elif [ "$OKS" -gt 0 ]; then
-            echo "::notice::[OK][positive] arch=$ARCH kernel=$KERNEL_HINT ok=$OKS skip=$SKIPS fail=$FAILS artifacts=.ko+.dtbo"
+            echo "::notice::OK: targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS artifacts=.ko+.dtbo"
           else
-            echo "::warning::[WARN][warning] arch=$ARCH kernel=$KERNEL_HINT ok=$OKS skip=$SKIPS fail=$FAILS"
+            echo "::warning::WARN: targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS"
           fi
 
       - name: Fail with context
         if: steps.download_headers.outputs.skip != 'true' && steps.build.outcome == 'failure'
         run: |
-          echo "::error::❌ One or more builds failed for arch ${{ matrix.arch }}"
+          echo "::error::One or more kernel target builds failed"
           exit 1
