@@ -55,6 +55,8 @@ jobs:
           sudo dpkg --add-architecture arm64
           sudo dpkg --add-architecture armhf
           sudo apt-get update --allow-releaseinfo-change || true
+          # Allow execution of armhf host tools (modpost/fixdep) on arm64 runner when needed.
+          sudo apt-get install -y libc6:armhf libstdc++6:armhf
 
       - name: Add Raspberry Pi OS repository and GPG key
         run: |
@@ -339,20 +341,46 @@ jobs:
               fi
 
               KBUILD_PKG="linux-kbuild-${BASE_RPT}"
-              if ! apt download "$KBUILD_PKG:$HOST_ARCH" >/dev/null 2>&1; then
-                if ! apt download "$KBUILD_PKG" >/dev/null 2>&1; then
-                  echo "::warning::Skipping kernel '$KVER': missing host kbuild package '$KBUILD_PKG'"
-                  continue
+              KBUILD_OK=0
+              if [ "$APT_ARCH" = "armhf" ] && [ "$HOST_ARCH" = "arm64" ]; then
+                if apt download "$KBUILD_PKG:armhf" >/dev/null 2>&1; then
+                  KBUILD_OK=1
+                elif apt download "$KBUILD_PKG:$HOST_ARCH" >/dev/null 2>&1; then
+                  KBUILD_OK=1
                 fi
+              else
+                if apt download "$KBUILD_PKG:$HOST_ARCH" >/dev/null 2>&1; then
+                  KBUILD_OK=1
+                fi
+              fi
+              if [ "$KBUILD_OK" -ne 1 ] && apt download "$KBUILD_PKG" >/dev/null 2>&1; then
+                KBUILD_OK=1
+              fi
+              if [ "$KBUILD_OK" -ne 1 ]; then
+                echo "::warning::Skipping kernel '$KVER': missing host kbuild package '$KBUILD_PKG'"
+                continue
               fi
             else
               # Ubuntu raspi packages usually use linux-kbuild-<major.minor>.
               KBUILD_PKG="linux-kbuild-${LINE}"
-              if ! apt download "$KBUILD_PKG:$HOST_ARCH" >/dev/null 2>&1; then
-                if ! apt download "$KBUILD_PKG" >/dev/null 2>&1; then
-                  echo "::warning::Skipping kernel '$KVER': host kbuild package '$KBUILD_PKG' not found"
-                  continue
+              KBUILD_OK=0
+              if [ "$APT_ARCH" = "armhf" ] && [ "$HOST_ARCH" = "arm64" ]; then
+                if apt download "$KBUILD_PKG:armhf" >/dev/null 2>&1; then
+                  KBUILD_OK=1
+                elif apt download "$KBUILD_PKG:$HOST_ARCH" >/dev/null 2>&1; then
+                  KBUILD_OK=1
                 fi
+              else
+                if apt download "$KBUILD_PKG:$HOST_ARCH" >/dev/null 2>&1; then
+                  KBUILD_OK=1
+                fi
+              fi
+              if [ "$KBUILD_OK" -ne 1 ] && apt download "$KBUILD_PKG" >/dev/null 2>&1; then
+                KBUILD_OK=1
+              fi
+              if [ "$KBUILD_OK" -ne 1 ]; then
+                echo "::warning::Skipping kernel '$KVER': host kbuild package '$KBUILD_PKG' not found"
+                continue
               fi
             fi
 
@@ -467,9 +495,23 @@ jobs:
 
             KBUILD_DEB=""
             if [ "$FAMILY" = "rpi" ] && [ -n "$BASE_RPT" ]; then
-              KBUILD_DEB=$(ls "$GITHUB_WORKSPACE"/linux-kbuild-${BASE_RPT}*.deb | grep -E "_(${HOST_ARCH}|all)\.deb$" | head -n1 || true)
+              if [ "$APT_ARCH" = "armhf" ] && [ "$HOST_ARCH" = "arm64" ]; then
+                for karch in armhf "$HOST_ARCH" all; do
+                  KBUILD_DEB=$(ls "$GITHUB_WORKSPACE"/linux-kbuild-${BASE_RPT}*.deb | grep -E "_${karch}\.deb$" | head -n1 || true)
+                  [ -n "$KBUILD_DEB" ] && break
+                done
+              else
+                KBUILD_DEB=$(ls "$GITHUB_WORKSPACE"/linux-kbuild-${BASE_RPT}*.deb | grep -E "_(${HOST_ARCH}|all)\.deb$" | head -n1 || true)
+              fi
             else
-              KBUILD_DEB=$(ls "$GITHUB_WORKSPACE"/linux-kbuild-${LINE}*.deb | grep -E "_(${HOST_ARCH}|all)\.deb$" | head -n1 || true)
+              if [ "$APT_ARCH" = "armhf" ] && [ "$HOST_ARCH" = "arm64" ]; then
+                for karch in armhf "$HOST_ARCH" all; do
+                  KBUILD_DEB=$(ls "$GITHUB_WORKSPACE"/linux-kbuild-${LINE}*.deb | grep -E "_${karch}\.deb$" | head -n1 || true)
+                  [ -n "$KBUILD_DEB" ] && break
+                done
+              else
+                KBUILD_DEB=$(ls "$GITHUB_WORKSPACE"/linux-kbuild-${LINE}*.deb | grep -E "_(${HOST_ARCH}|all)\.deb$" | head -n1 || true)
+              fi
             fi
             if [ -z "$KBUILD_DEB" ] || [ ! -s "$KBUILD_DEB" ]; then
               echo "::warning::Skipping kernel $KVER: missing host kbuild deb"
@@ -482,7 +524,8 @@ jobs:
 
             KBUILD_DEB_ARCH="$(dpkg-deb -f "$KBUILD_DEB" Architecture || true)"
             echo "Selected kbuild deb architecture: ${KBUILD_DEB_ARCH:-unknown} (host: $HOST_ARCH)"
-            if [ "$KBUILD_DEB_ARCH" != "$HOST_ARCH" ] && [ "$KBUILD_DEB_ARCH" != "all" ]; then
+            if [ "$KBUILD_DEB_ARCH" != "$HOST_ARCH" ] && [ "$KBUILD_DEB_ARCH" != "all" ] \
+              && ! { [ "$HOST_ARCH" = "arm64" ] && [ "$KBUILD_DEB_ARCH" = "armhf" ]; }; then
               echo "::error::Kernel $KVER failed: kbuild package architecture does not match host"
               FAIL=1
               FAILS=$((FAILS + 1))
@@ -631,7 +674,7 @@ jobs:
                 FAILS=$((FAILS + 1))
                 FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KVER"
               else
-                echo "Build OK for kernel $KVER"
+                echo "::notice::Kernel $KVER succeeded"
                 OKS=$((OKS + 1))
                 OK_KERNELS="${OK_KERNELS:+$OK_KERNELS,}$KVER"
               fi
@@ -714,12 +757,6 @@ jobs:
           [ -z "$SKIPS" ] && SKIPS=0
           [ -z "$FAILS" ] && FAILS=0
 
-          if [ -n "$OK_KERNELS" ]; then
-            echo "::notice::Succeeded kernels: $OK_KERNELS"
-          fi
-          if [ -n "$FAIL_KERNELS" ]; then
-            echo "::error::Failed kernels: $FAIL_KERNELS"
-          fi
           if [ -n "$SKIP_KERNELS" ]; then
             echo "::warning::Skipped kernels: $SKIP_KERNELS"
           fi
