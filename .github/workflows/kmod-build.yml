@@ -38,9 +38,28 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -e
+          HOST_ARCH="$(dpkg --print-architecture)"
+          ARCHS='${{ inputs.archs }}'
+          echo "Runner host architecture: $HOST_ARCH"
+          echo "Requested build arch matrix: $ARCHS"
           sudo apt update
-          # Install build tools and gcc-12 cross-compilers expected by RPi kernel headers
-          sudo apt install -y build-essential jq curl xz-utils gnupg gcc-12-aarch64-linux-gnu gcc-12-arm-linux-gnueabihf
+          # Base tools and native compiler
+          sudo apt install -y build-essential jq curl xz-utils gnupg gcc-12
+
+          # Cross toolchain for arm64 is needed only on non-arm64 hosts.
+          if echo "$ARCHS" | grep -q '"arm64"'; then
+            if [ "$HOST_ARCH" != "arm64" ]; then
+              sudo apt install -y gcc-12-aarch64-linux-gnu
+            else
+              echo "arm64 target on arm64 host: using native gcc-12 (no aarch64 cross compiler required)"
+            fi
+          fi
+
+          # Cross toolchain for 32-bit ARM targets.
+          if echo "$ARCHS" | grep -Eq '"armhf"|"arm"'; then
+            sudo apt install -y gcc-12-arm-linux-gnueabihf
+          fi
 
       - name: Enable arm64 architecture for apt
         run: |
@@ -184,7 +203,11 @@ jobs:
             # Determine cross-compile tuple from matrix arch
             case "$ARCH" in
               arm64)
-                CROSS_COMPILE="aarch64-linux-gnu-"
+                if [ "$HOST_ARCH" = "arm64" ]; then
+                  CROSS_COMPILE=""
+                else
+                  CROSS_COMPILE="aarch64-linux-gnu-"
+                fi
                 KARCH="arm64"
                 ;;
               armhf|arm)
@@ -224,12 +247,24 @@ jobs:
             echo "== Kbuild tools/debug =="
             ls -l root/usr/src/linux-kbuild-${BASE_VERSION}/scripts/basic/fixdep || true
             file root/usr/src/linux-kbuild-${BASE_VERSION}/scripts/basic/fixdep || true
-            command -v ${CROSS_COMPILE}gcc-12 || true
-            ${CROSS_COMPILE}gcc-12 --version || true
 
-            echo "Running: make -C $KDIR ARCH=$KARCH CROSS_COMPILE=$CROSS_COMPILE M=$PWD modules"
+            if [ -n "$CROSS_COMPILE" ]; then
+              CC_BIN="${CROSS_COMPILE}gcc-12"
+            else
+              CC_BIN="gcc-12"
+            fi
+            echo "Selected compiler binary: $CC_BIN"
+            if ! command -v "$CC_BIN" >/dev/null 2>&1; then
+              echo "❌ Compiler not found: $CC_BIN"
+              echo "| $HDRDIR | $ARCH | FAIL | missing compiler $CC_BIN |" >> "$SUMMARY"
+              FAIL=1
+              continue
+            fi
+            "$CC_BIN" --version || true
 
-            if make -C "$KDIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" M="$PWD" modules; then
+            echo "Running: make -C $KDIR ARCH=$KARCH CROSS_COMPILE=$CROSS_COMPILE CC=$CC_BIN M=$PWD modules"
+
+            if make -C "$KDIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" CC="$CC_BIN" M="$PWD" modules; then
               echo "✅ Build OK"
               RESULT="OK"
               NOTE=""
@@ -279,7 +314,11 @@ jobs:
       - name: Show build summary
         if: always()
         run: |
-          echo "::notice file=summary.txt::$(cat $GITHUB_WORKSPACE/summary.txt)"
+          if [ -f "$GITHUB_WORKSPACE/summary.txt" ]; then
+            echo "::notice file=summary.txt::$(cat $GITHUB_WORKSPACE/summary.txt)"
+          else
+            echo "::notice::No summary generated (build did not reach build step)"
+          fi
 
       - name: Fail with context
         if: steps.build.outcome == 'failure'
