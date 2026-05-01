@@ -7,10 +7,6 @@ on:
         required: false
         type: number
         default: 1
-      expected_target_count:
-        required: false
-        type: number
-        default: 0
       dry_run:
         required: false
         type: boolean
@@ -72,12 +68,11 @@ jobs:
           EXPLICIT_VERSIONS="${{ inputs.kernel_versions }}"
           EXPLICIT_LINES="${{ inputs.release_lines }}"
           NEWEST_LINES_COUNT="${{ inputs.newest_lines_count }}"
-          EXPECTED_TARGET_COUNT="${{ inputs.expected_target_count }}"
           DRY_RUN="${{ inputs.dry_run }}"
           HOST_ARCH="$(dpkg --print-architecture)"
 
           echo "Host architecture: $HOST_ARCH"
-          echo "Selection inputs: newest_lines_count=$NEWEST_LINES_COUNT expected_target_count=$EXPECTED_TARGET_COUNT dry_run=$DRY_RUN release_lines='${EXPLICIT_LINES:-}' kernel_versions='${EXPLICIT_VERSIONS:-}'"
+          echo "Selection inputs: newest_lines_count=$NEWEST_LINES_COUNT dry_run=$DRY_RUN release_lines='${EXPLICIT_LINES:-}' kernel_versions='${EXPLICIT_VERSIONS:-}'"
 
           rm -f candidates.txt selected_targets.txt kernel_targets.txt
 
@@ -100,10 +95,16 @@ jobs:
                 next
               }
 
-              core=pkg
-              sub(/^([0-9]+\.[0-9]+\.[0-9]+).*/, "\\1", core)
-              line=core
-              sub(/^([0-9]+\.[0-9]+).*/, "\\1", line)
+              if (match(pkg, /^[0-9]+\.[0-9]+\.[0-9]+/)) {
+                core=substr(pkg, RSTART, RLENGTH)
+              } else {
+                next
+              }
+              if (match(core, /^[0-9]+\.[0-9]+/)) {
+                line=substr(core, RSTART, RLENGTH)
+              } else {
+                next
+              }
               print pkg "|" arch "|linux-headers-" pkg "|" family "|" core "|" line
             }
           ' | sort -u > candidates.txt
@@ -170,23 +171,12 @@ jobs:
           sort -u selected_targets.txt -o selected_targets.txt
 
           if [ ! -s selected_targets.txt ]; then
-            REASON="kernel selection produced no targets"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
-            echo "dry_run=false" >> "$GITHUB_OUTPUT"
-            echo "selected_target_count=0" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::error::Kernel selection produced no targets"
+            exit 1
           fi
 
           SELECTED_TARGET_COUNT="$(wc -l < selected_targets.txt | tr -d ' ')"
           [ -z "$SELECTED_TARGET_COUNT" ] && SELECTED_TARGET_COUNT=0
-
-          if [ "$EXPECTED_TARGET_COUNT" -gt 0 ] && [ "$SELECTED_TARGET_COUNT" -ne "$EXPECTED_TARGET_COUNT" ]; then
-            echo "::error::Target selection mismatch: expected=$EXPECTED_TARGET_COUNT selected=$SELECTED_TARGET_COUNT"
-            echo "Selected kernel targets (kver|arch|pkg|family|core|line):"
-            cat selected_targets.txt || true
-            exit 1
-          fi
 
           if [ "$DRY_RUN" = "true" ]; then
             echo "Dry-run selected kernel targets (kver|arch|pkg|family|core|line):"
@@ -502,6 +492,11 @@ jobs:
       - name: Show final status
         if: always()
         run: |
+          if [ "${{ steps.download_headers.outcome }}" = "failure" ]; then
+            echo "::error::FAIL: kernel selection/header preparation failed"
+            exit 1
+          fi
+
           if [ "${{ steps.download_headers.outputs.dry_run }}" = "true" ]; then
             SELECTED="${{ steps.download_headers.outputs.selected_target_count }}"
             [ -z "$SELECTED" ] && SELECTED=0
