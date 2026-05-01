@@ -19,14 +19,14 @@ on:
         required: false
         type: string
         default: ''
+      build_families:
+        required: false
+        type: string
+        default: 'rpi'
       module_path:
         required: false
         type: string
         default: '.'
-      rpi_codename:
-        required: false
-        type: string
-        default: 'bookworm'
 
 jobs:
   build:
@@ -56,7 +56,18 @@ jobs:
 
       - name: Add Raspberry Pi OS repository and GPG key
         run: |
-          CODENAME="${{ inputs.rpi_codename }}"
+          set -e
+          DISTRO_INFO_URL="https://salsa.debian.org/debian/distro-info-data/-/raw/main/debian.csv"
+          TODAY="$(date -u +%F)"
+          CODENAME="$(curl -fsSL "$DISTRO_INFO_URL" | awk -F',' -v today="$TODAY" 'NR > 1 && $5 != "" && $5 <= today { if ($5 > max) { max=$5; code=$2 } } END { print code }')"
+          CODENAME_SOURCE="debian-distro-info"
+          if [ -z "$CODENAME" ]; then
+            CODENAME="trixie"
+            CODENAME_SOURCE="fallback-trixie"
+            echo "::warning::Failed to resolve Debian codename from distro-info; falling back to '$CODENAME'"
+          fi
+
+          echo "Resolved Raspberry Pi repository codename: $CODENAME (source: $CODENAME_SOURCE)"
           echo "deb http://archive.raspberrypi.org/debian/ $CODENAME main" | sudo tee /etc/apt/sources.list.d/raspi.list
           curl -fsSL https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/raspberrypi.gpg
           sudo apt-get update --allow-releaseinfo-change || true
@@ -69,15 +80,40 @@ jobs:
           EXPLICIT_LINES="${{ inputs.release_lines }}"
           NEWEST_LINES_COUNT="${{ inputs.newest_lines_count }}"
           DRY_RUN="${{ inputs.dry_run }}"
+          BUILD_FAMILIES_RAW="${{ inputs.build_families }}"
           HOST_ARCH="$(dpkg --print-architecture)"
+
+          BUILD_FAMILIES="$(echo "$BUILD_FAMILIES_RAW" | tr '[:upper:]' '[:lower:]' | tr ',' ' ')"
+          INCLUDE_RPI=0
+          INCLUDE_UBUNTU=0
+          for family in $BUILD_FAMILIES; do
+            family="$(echo "$family" | xargs)"
+            [ -z "$family" ] && continue
+            case "$family" in
+              rpi)
+                INCLUDE_RPI=1
+                ;;
+              ubuntu)
+                INCLUDE_UBUNTU=1
+                ;;
+              *)
+                echo "::warning::Ignoring invalid build_families token '$family'"
+                ;;
+            esac
+          done
+          if [ "$INCLUDE_RPI" -eq 0 ] && [ "$INCLUDE_UBUNTU" -eq 0 ]; then
+            INCLUDE_RPI=1
+            echo "::warning::No valid build_families token found; defaulting to rpi"
+          fi
 
           echo "Host architecture: $HOST_ARCH"
           echo "Selection inputs: newest_lines_count=$NEWEST_LINES_COUNT dry_run=$DRY_RUN release_lines='${EXPLICIT_LINES:-}' kernel_versions='${EXPLICIT_VERSIONS:-}'"
+          echo "Family selection: include_rpi=$INCLUDE_RPI include_ubuntu=$INCLUDE_UBUNTU"
 
           rm -f candidates.txt selected_targets.txt kernel_targets.txt
 
-          # Collect candidate header packages from both Raspberry Pi and Ubuntu raspi flavors.
-          apt list -a 'linux-headers-*' 2>/dev/null | awk '
+          # Collect candidate header packages from enabled families.
+          apt list -a 'linux-headers-*' 2>/dev/null | awk -v include_rpi="$INCLUDE_RPI" -v include_ubuntu="$INCLUDE_UBUNTU" '
             /^linux-headers-[0-9]/ {
               split($1, path, "/")
               pkg=path[1]
@@ -94,6 +130,9 @@ jobs:
               } else {
                 next
               }
+
+              if (family == "rpi" && include_rpi != 1) next
+              if (family == "ubuntu" && include_ubuntu != 1) next
 
               # For Ubuntu raspi kernels include ABI in core (e.g. 6.8.0-1053)
               # so "latest core in a line" does not collapse to every historical ABI.
@@ -123,10 +162,30 @@ jobs:
 
           if [ ! -s candidates.txt ]; then
             REASON="no kernel headers were discovered in apt metadata"
+            RPI_SELECTED_COUNT=0
+            UBUNTU_SELECTED_COUNT=0
+            RPI_BUILD_TARGET_COUNT=0
+            UBUNTU_BUILD_TARGET_COUNT=0
+            FAMILY_POLICY_FAILED=false
+            FAMILY_POLICY_REASON=""
+            if [ "$INCLUDE_RPI" -eq 1 ]; then
+              FAMILY_POLICY_FAILED=true
+              FAMILY_POLICY_REASON="${FAMILY_POLICY_REASON:+$FAMILY_POLICY_REASON,}rpi=0"
+            fi
+            if [ "$INCLUDE_UBUNTU" -eq 1 ]; then
+              FAMILY_POLICY_FAILED=true
+              FAMILY_POLICY_REASON="${FAMILY_POLICY_REASON:+$FAMILY_POLICY_REASON,}ubuntu=0"
+            fi
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
             echo "dry_run=false" >> "$GITHUB_OUTPUT"
             echo "selected_target_count=0" >> "$GITHUB_OUTPUT"
+            echo "selected_rpi_count=$RPI_SELECTED_COUNT" >> "$GITHUB_OUTPUT"
+            echo "selected_ubuntu_count=$UBUNTU_SELECTED_COUNT" >> "$GITHUB_OUTPUT"
+            echo "build_target_rpi_count=$RPI_BUILD_TARGET_COUNT" >> "$GITHUB_OUTPUT"
+            echo "build_target_ubuntu_count=$UBUNTU_BUILD_TARGET_COUNT" >> "$GITHUB_OUTPUT"
+            echo "family_policy_failed=$FAMILY_POLICY_FAILED" >> "$GITHUB_OUTPUT"
+            echo "family_policy_reason=$FAMILY_POLICY_REASON" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -206,10 +265,8 @@ jobs:
           RPI_SELECTED_COUNT="$(awk -F'|' '$4 == "rpi" { c++ } END { print c+0 }' selected_targets.txt)"
           UBUNTU_SELECTED_COUNT="$(awk -F'|' '$4 == "ubuntu" { c++ } END { print c+0 }' selected_targets.txt)"
           echo "Selected families: rpi=$RPI_SELECTED_COUNT ubuntu=$UBUNTU_SELECTED_COUNT"
-          if [ "$RPI_SELECTED_COUNT" -eq 0 ] || [ "$UBUNTU_SELECTED_COUNT" -eq 0 ]; then
-            echo "::error::Kernel selection must include both families: rpi=$RPI_SELECTED_COUNT ubuntu=$UBUNTU_SELECTED_COUNT"
-            exit 1
-          fi
+
+          : > kernel_targets.txt
 
           while IFS='|' read -r KVER APT_ARCH HEADER_PKG FAMILY CORE LINE; do
             [ -z "$KVER" ] && continue
@@ -258,27 +315,42 @@ jobs:
             fi
           done < selected_targets.txt
 
+          if [ -s kernel_targets.txt ]; then
+            sort -u kernel_targets.txt -o kernel_targets.txt
+          fi
+
+          RPI_BUILD_TARGET_COUNT="$(awk -F'|' '$4 == "rpi" { c++ } END { print c+0 }' kernel_targets.txt)"
+          UBUNTU_BUILD_TARGET_COUNT="$(awk -F'|' '$4 == "ubuntu" { c++ } END { print c+0 }' kernel_targets.txt)"
+          echo "Build-target families: rpi=$RPI_BUILD_TARGET_COUNT ubuntu=$UBUNTU_BUILD_TARGET_COUNT"
+
+          FAMILY_POLICY_FAILED=false
+          FAMILY_POLICY_REASON=""
+          if [ "$INCLUDE_RPI" -eq 1 ] && [ "$RPI_BUILD_TARGET_COUNT" -eq 0 ]; then
+            FAMILY_POLICY_FAILED=true
+            FAMILY_POLICY_REASON="${FAMILY_POLICY_REASON:+$FAMILY_POLICY_REASON,}rpi=0"
+          fi
+          if [ "$INCLUDE_UBUNTU" -eq 1 ] && [ "$UBUNTU_BUILD_TARGET_COUNT" -eq 0 ]; then
+            FAMILY_POLICY_FAILED=true
+            FAMILY_POLICY_REASON="${FAMILY_POLICY_REASON:+$FAMILY_POLICY_REASON,}ubuntu=0"
+          fi
+
           if [ ! -s kernel_targets.txt ]; then
             REASON="no kernels passed package download checks"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
             echo "dry_run=false" >> "$GITHUB_OUTPUT"
             echo "selected_target_count=$SELECTED_TARGET_COUNT" >> "$GITHUB_OUTPUT"
+            echo "selected_rpi_count=$RPI_SELECTED_COUNT" >> "$GITHUB_OUTPUT"
+            echo "selected_ubuntu_count=$UBUNTU_SELECTED_COUNT" >> "$GITHUB_OUTPUT"
+            echo "build_target_rpi_count=$RPI_BUILD_TARGET_COUNT" >> "$GITHUB_OUTPUT"
+            echo "build_target_ubuntu_count=$UBUNTU_BUILD_TARGET_COUNT" >> "$GITHUB_OUTPUT"
+            echo "family_policy_failed=$FAMILY_POLICY_FAILED" >> "$GITHUB_OUTPUT"
+            echo "family_policy_reason=$FAMILY_POLICY_REASON" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          sort -u kernel_targets.txt -o kernel_targets.txt
-
           echo "Selected build targets (kver|arch|pkg|family|core|line):"
           cat kernel_targets.txt
-
-          RPI_BUILD_TARGET_COUNT="$(awk -F'|' '$4 == "rpi" { c++ } END { print c+0 }' kernel_targets.txt)"
-          UBUNTU_BUILD_TARGET_COUNT="$(awk -F'|' '$4 == "ubuntu" { c++ } END { print c+0 }' kernel_targets.txt)"
-          echo "Build-target families: rpi=$RPI_BUILD_TARGET_COUNT ubuntu=$UBUNTU_BUILD_TARGET_COUNT"
-          if [ "$RPI_BUILD_TARGET_COUNT" -eq 0 ] || [ "$UBUNTU_BUILD_TARGET_COUNT" -eq 0 ]; then
-            echo "::error::Build target set must include both families after package checks: rpi=$RPI_BUILD_TARGET_COUNT ubuntu=$UBUNTU_BUILD_TARGET_COUNT"
-            exit 1
-          fi
 
           echo "== Downloaded .deb files =="
           ls -lh "$GITHUB_WORKSPACE"/*.deb || echo "No debs found"
@@ -286,6 +358,12 @@ jobs:
           echo "skip_reason=" >> "$GITHUB_OUTPUT"
           echo "dry_run=false" >> "$GITHUB_OUTPUT"
           echo "selected_target_count=$SELECTED_TARGET_COUNT" >> "$GITHUB_OUTPUT"
+          echo "selected_rpi_count=$RPI_SELECTED_COUNT" >> "$GITHUB_OUTPUT"
+          echo "selected_ubuntu_count=$UBUNTU_SELECTED_COUNT" >> "$GITHUB_OUTPUT"
+          echo "build_target_rpi_count=$RPI_BUILD_TARGET_COUNT" >> "$GITHUB_OUTPUT"
+          echo "build_target_ubuntu_count=$UBUNTU_BUILD_TARGET_COUNT" >> "$GITHUB_OUTPUT"
+          echo "family_policy_failed=$FAMILY_POLICY_FAILED" >> "$GITHUB_OUTPUT"
+          echo "family_policy_reason=$FAMILY_POLICY_REASON" >> "$GITHUB_OUTPUT"
 
       - name: Build against kernels
         id: build
@@ -545,8 +623,17 @@ jobs:
           fi
 
           if [ "${{ steps.download_headers.outputs.skip }}" = "true" ]; then
+            if [ "${{ steps.download_headers.outputs.family_policy_failed }}" = "true" ]; then
+              echo "::error::FAIL: family policy violation (required families missing): ${{ steps.download_headers.outputs.family_policy_reason }} selected[rpi=${{ steps.download_headers.outputs.selected_rpi_count }},ubuntu=${{ steps.download_headers.outputs.selected_ubuntu_count }}] build_targets[rpi=${{ steps.download_headers.outputs.build_target_rpi_count }},ubuntu=${{ steps.download_headers.outputs.build_target_ubuntu_count }}]"
+              exit 1
+            fi
             echo "::warning::SKIP: ${{ steps.download_headers.outputs.skip_reason }}"
             exit 0
+          fi
+
+          if [ "${{ steps.download_headers.outputs.family_policy_failed }}" = "true" ]; then
+            echo "::error::FAIL: family policy violation (required families missing): ${{ steps.download_headers.outputs.family_policy_reason }} selected[rpi=${{ steps.download_headers.outputs.selected_rpi_count }},ubuntu=${{ steps.download_headers.outputs.selected_ubuntu_count }}] build_targets[rpi=${{ steps.download_headers.outputs.build_target_rpi_count }},ubuntu=${{ steps.download_headers.outputs.build_target_ubuntu_count }}]"
+            exit 1
           fi
 
           TARGETS="${{ steps.build.outputs.target_count }}"
