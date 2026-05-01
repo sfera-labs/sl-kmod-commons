@@ -89,16 +89,28 @@ jobs:
               family=""
               if (pkg ~ /\+rpt-/) {
                 family="rpi"
-              } else if (pkg ~ /-raspi([-.].*)?$/) {
+              } else if (pkg ~ /-raspi$/) {
                 family="ubuntu"
               } else {
                 next
               }
 
-              if (match(pkg, /^[0-9]+\.[0-9]+\.[0-9]+/)) {
-                core=substr(pkg, RSTART, RLENGTH)
+              # For Ubuntu raspi kernels include ABI in core (e.g. 6.8.0-1053)
+              # so "latest core in a line" does not collapse to every historical ABI.
+              if (family == "ubuntu") {
+                if (match(pkg, /^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+/)) {
+                  core=substr(pkg, RSTART, RLENGTH)
+                } else if (match(pkg, /^[0-9]+\.[0-9]+\.[0-9]+/)) {
+                  core=substr(pkg, RSTART, RLENGTH)
+                } else {
+                  next
+                }
               } else {
-                next
+                if (match(pkg, /^[0-9]+\.[0-9]+\.[0-9]+/)) {
+                  core=substr(pkg, RSTART, RLENGTH)
+                } else {
+                  next
+                }
               }
               if (match(core, /^[0-9]+\.[0-9]+/)) {
                 line=substr(core, RSTART, RLENGTH)
@@ -226,7 +238,8 @@ jobs:
               KBUILD_PKG="linux-kbuild-${LINE}"
               if ! apt download "$KBUILD_PKG:$HOST_ARCH" >/dev/null 2>&1; then
                 if ! apt download "$KBUILD_PKG" >/dev/null 2>&1; then
-                  echo "::warning::Kernel '$KVER': host kbuild package '$KBUILD_PKG' not found; continuing"
+                  echo "::warning::Skipping kernel '$KVER': host kbuild package '$KBUILD_PKG' not found"
+                  continue
                 fi
               fi
             fi
@@ -377,8 +390,8 @@ jobs:
                 echo "::warning::Skipping kernel $KVER: unsupported inferred package architecture '$APT_ARCH'"
                 SKIPS=$((SKIPS + 1))
                 continue
-              fi
-            fi
+                ;;
+            esac
 
             # Always use the arch/flavor-specific headers directory for building
             HDRDIR=""
