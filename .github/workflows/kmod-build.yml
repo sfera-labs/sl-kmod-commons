@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Checkout module repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
@@ -45,7 +45,7 @@ jobs:
           echo "Requested build arch matrix: $ARCHS"
           sudo apt update
           # Base tools and native compiler
-          sudo apt install -y build-essential jq curl xz-utils gnupg gcc-12
+          sudo apt install -y build-essential jq curl xz-utils gnupg gcc-12 device-tree-compiler
 
           # Cross toolchain for arm64 is needed only on non-arm64 hosts.
           if echo "$ARCHS" | grep -q '"arm64"'; then
@@ -63,9 +63,20 @@ jobs:
 
       - name: Enable arm64 architecture for apt
         run: |
-          sudo dpkg --add-architecture arm64
-          # Allow apt-get update to succeed even if some arm64 indexes are missing
-          sudo apt-get update --allow-releaseinfo-change || true
+          set -e
+          HOST_ARCH="$(dpkg --print-architecture)"
+          ARCHS='${{ inputs.archs }}'
+          ONLY_ARM64="$(echo "$ARCHS" | jq -r 'length == 1 and .[0] == "arm64"')"
+
+          # Optimization: on arm64 runner with arm64-only matrix, adding arm64 is redundant.
+          if [ "$HOST_ARCH" = "arm64" ] && [ "$ONLY_ARM64" = "true" ]; then
+            echo "Skipping dpkg --add-architecture arm64: host is arm64 and matrix is arm64-only"
+          else
+            echo "Enabling arm64 foreign architecture for apt (host=$HOST_ARCH, matrix=$ARCHS)"
+            sudo dpkg --add-architecture arm64
+            # Keep update tolerant because third-party mirrors can transiently miss some indexes.
+            sudo apt-get update --allow-releaseinfo-change || true
+          fi
 
       - name: Add Raspberry Pi OS repository and GPG key
         run: |
@@ -240,9 +251,17 @@ jobs:
             echo "Headers version: $HDRDIR"
             echo "Build dir: $KDIR"
 
-            # Symlink /usr/src to extracted headers so Makefile references work
+            # Symlink /usr/src to extracted headers so Makefile references work.
+            # This helps with header scripts that assume /usr/src paths.
             sudo rm -rf /usr/src
             sudo ln -s "$GITHUB_WORKSPACE/root/usr/src" /usr/src
+
+            # Mimic local user flow while binding to selected downloaded headers.
+            # Local make uses KVER -> /lib/modules/<KVER>/build, so wire that path explicitly.
+            echo "Binding /lib/modules/$KVER/build -> $KDIR"
+            sudo mkdir -p "/lib/modules/$KVER"
+            sudo rm -rf "/lib/modules/$KVER/build"
+            sudo ln -s "$KDIR" "/lib/modules/$KVER/build"
 
             echo "== Kbuild tools/debug =="
             ls -l root/usr/src/linux-kbuild-${BASE_VERSION}/scripts/basic/fixdep || true
@@ -262,12 +281,35 @@ jobs:
             fi
             "$CC_BIN" --version || true
 
-            echo "Running: make -C $KDIR ARCH=$KARCH CROSS_COMPILE=$CROSS_COMPILE CC=$CC_BIN M=$PWD modules"
+            echo "Running local-style build commands from module directory"
+            echo "Command: make clean"
+            echo "Command: make"
 
-            if make -C "$KDIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" CC="$CC_BIN" M="$PWD" modules; then
-              echo "✅ Build OK"
-              RESULT="OK"
-              NOTE=""
+            # Export architecture/toolchain variables so local make path remains explicit and debuggable.
+            export ARCH="$KARCH"
+            export CROSS_COMPILE="$CROSS_COMPILE"
+            export CC="$CC_BIN"
+            export KVER="$KVER"
+
+            # Keep clean non-fatal: first build on a fresh checkout may not have artifacts to clean.
+            make clean || true
+
+            if make; then
+              KO_COUNT="$(find . -maxdepth 1 -type f -name '*.ko' | wc -l | tr -d ' ')"
+              DTBO_COUNT="$(find . -maxdepth 1 -type f -name '*.dtbo' | wc -l | tr -d ' ')"
+              echo "Produced artifacts count: ko=$KO_COUNT dtbo=$DTBO_COUNT"
+
+              # Strict contract: both outputs are expected from local make flow.
+              if [ "$KO_COUNT" -eq 0 ] || [ "$DTBO_COUNT" -eq 0 ]; then
+                echo "❌ Expected outputs missing after make (.ko and .dtbo are both required)"
+                RESULT="FAIL"
+                NOTE="missing expected artifacts: ko=$KO_COUNT dtbo=$DTBO_COUNT"
+                FAIL=1
+              else
+                echo "✅ Build OK"
+                RESULT="OK"
+                NOTE=""
+              fi
             else
               echo "❌ Build failed"
               RESULT="FAIL"
@@ -280,8 +322,8 @@ jobs:
             if [ "$RESULT" = "OK" ]; then
               OUT="$GITHUB_WORKSPACE/artifacts/$ARCH/$HDRDIR"
               mkdir -p "$OUT"
-              cp -v ./*.ko "$OUT/" 2>/dev/null || true
-              cp -v ./*.dtbo "$OUT/" 2>/dev/null || true
+              find . -maxdepth 1 -type f -name '*.ko' -print -exec cp -v {} "$OUT/" \;
+              find . -maxdepth 1 -type f -name '*.dtbo' -print -exec cp -v {} "$OUT/" \;
             fi
           done < kernel_versions.txt
 
@@ -306,7 +348,7 @@ jobs:
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ko-${{ matrix.arch }}
           path: artifacts/${{ matrix.arch }}/
