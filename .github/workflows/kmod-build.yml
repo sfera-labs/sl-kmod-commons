@@ -25,7 +25,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
 
     strategy:
       fail-fast: false
@@ -79,13 +79,11 @@ jobs:
                 echo "::error::Failed to download $COMMON_PKG:$ARCH or $COMMON_PKG (all)" && exit 1
               fi
             fi
-            # Download kbuild tools for the HOST architecture (fixdep runs on the CI runner)
+            # Download kbuild tools for the HOST architecture (fixdep runs on the CI runner).
+            # Never force target-arch kbuild here, because fixdep is executed on the runner host.
             if ! apt download "$KBUILD_PKG:$HOST_ARCH"; then
-              echo "::notice::Host-arch kbuild not found as $KBUILD_PKG:$HOST_ARCH, trying target arch $ARCH"
-              if ! apt download "$KBUILD_PKG:$ARCH"; then
-                echo "::notice::Target-arch kbuild not found as $KBUILD_PKG:$ARCH, trying unqualified package"
-                apt download "$KBUILD_PKG" || (echo "::error::Failed to download $KBUILD_PKG for host or target architecture" && exit 1)
-              fi
+              echo "::notice::Host-arch kbuild not found as $KBUILD_PKG:$HOST_ARCH, trying unqualified package"
+              apt download "$KBUILD_PKG" || (echo "::error::Failed to download $KBUILD_PKG for host architecture $HOST_ARCH" && exit 1)
             fi
             echo "$KERNEL_VERSION" > kernel_versions.txt
           else
@@ -114,6 +112,8 @@ jobs:
           FAIL=0
           SUMMARY="$GITHUB_WORKSPACE/summary.txt"
           ARCH="${{ matrix.arch }}"
+          HOST_ARCH="$(dpkg --print-architecture)"
+          echo "Runner host architecture in build step: $HOST_ARCH"
           echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
           echo "|--------|------|--------|------|" >> "$SUMMARY"
 
@@ -125,11 +125,24 @@ jobs:
             HEADERS_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER*.deb | grep -v common | head -n1)
             BASE_VERSION=$(echo "$KVER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
             COMMON_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-${BASE_VERSION}-common-rpi*.deb | head -n1)
-            KBUILD_DEB=$(ls $GITHUB_WORKSPACE/linux-kbuild-${BASE_VERSION}*.deb | head -n1)
+            KBUILD_DEB=$(ls $GITHUB_WORKSPACE/linux-kbuild-${BASE_VERSION}*.deb | grep -E "_(${HOST_ARCH}|all)\.deb$" | head -n1 || true)
+            if [ -z "$KBUILD_DEB" ]; then
+              KBUILD_DEB=$(ls $GITHUB_WORKSPACE/linux-kbuild-${BASE_VERSION}*.deb | head -n1)
+              echo "::warning::No host-matching kbuild .deb found; tentatively selected $KBUILD_DEB"
+            fi
             echo "Preparing to extract: $HEADERS_DEB, $COMMON_DEB and $KBUILD_DEB"
             if [ ! -s "$HEADERS_DEB" ] || [ ! -s "$COMMON_DEB" ] || [ ! -s "$KBUILD_DEB" ]; then
               echo "❌ Downloaded package deb not found or empty: $HEADERS_DEB $COMMON_DEB $KBUILD_DEB"
               echo "| $HEADERS_DEB $COMMON_DEB $KBUILD_DEB | $ARCH | SKIP | download failed |" >> "$SUMMARY"
+              continue
+            fi
+
+            KBUILD_DEB_ARCH="$(dpkg-deb -f "$KBUILD_DEB" Architecture || true)"
+            echo "Selected kbuild deb architecture: ${KBUILD_DEB_ARCH:-unknown} (host: $HOST_ARCH)"
+            if [ "$KBUILD_DEB_ARCH" != "$HOST_ARCH" ] && [ "$KBUILD_DEB_ARCH" != "all" ]; then
+              echo "❌ Selected kbuild .deb arch ($KBUILD_DEB_ARCH) does not match host arch ($HOST_ARCH)"
+              echo "| $KBUILD_DEB | $ARCH | FAIL | kbuild arch mismatch host=$HOST_ARCH pkg=$KBUILD_DEB_ARCH |" >> "$SUMMARY"
+              FAIL=1
               continue
             fi
             rm -rf root
