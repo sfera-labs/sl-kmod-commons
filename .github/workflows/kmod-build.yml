@@ -67,6 +67,7 @@ jobs:
           HOST_ARCH="$(dpkg --print-architecture)"
           ARCHS='${{ inputs.archs }}'
           ONLY_ARM64="$(echo "$ARCHS" | jq -r 'length == 1 and .[0] == "arm64"')"
+          NEED_ARMHF="$(echo "$ARCHS" | jq -r 'map(select(. == "armhf" or . == "arm")) | length > 0')"
 
           # Optimization: on arm64 runner with arm64-only matrix, adding arm64 is redundant.
           if [ "$HOST_ARCH" = "arm64" ] && [ "$ONLY_ARM64" = "true" ]; then
@@ -74,9 +75,16 @@ jobs:
           else
             echo "Enabling arm64 foreign architecture for apt (host=$HOST_ARCH, matrix=$ARCHS)"
             sudo dpkg --add-architecture arm64
-            # Keep update tolerant because third-party mirrors can transiently miss some indexes.
-            sudo apt-get update --allow-releaseinfo-change || true
           fi
+
+          # Enable armhf when 32-bit ARM targets are requested.
+          if [ "$NEED_ARMHF" = "true" ] && [ "$HOST_ARCH" != "armhf" ]; then
+            echo "Enabling armhf foreign architecture for apt (host=$HOST_ARCH, matrix=$ARCHS)"
+            sudo dpkg --add-architecture armhf
+          fi
+
+          # Keep update tolerant because third-party mirrors can transiently miss some indexes.
+          sudo apt-get update --allow-releaseinfo-change || true
 
       - name: Add Raspberry Pi OS repository and GPG key
         run: |
@@ -93,20 +101,60 @@ jobs:
           COUNT=${{ inputs.kernel_count }}
           ARCH="${{ matrix.arch }}"
           HOST_ARCH="$(dpkg --print-architecture)"
+          SUMMARY="$GITHUB_WORKSPACE/summary.txt"
+
+          # Map matrix arch to Debian apt architecture names used by packages.
+          case "$ARCH" in
+            arm64)
+              APT_ARCH="arm64"
+              ;;
+            armhf|arm)
+              APT_ARCH="armhf"
+              ;;
+            *)
+              REASON="Unsupported target arch '$ARCH' (supported: arm64, armhf, arm)"
+              echo "::notice::$REASON. Skipping this matrix job."
+              echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
+              echo "|--------|------|--------|------|" >> "$SUMMARY"
+              echo "| ${KERNEL_VERSION:-n/a} | $ARCH | SKIP | $REASON |" >> "$SUMMARY"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
+              echo "skip_arch=$ARCH" >> "$GITHUB_OUTPUT"
+              echo "skip_kernel=${KERNEL_VERSION:-auto}" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
           echo "Host architecture: $HOST_ARCH"
           echo "Target architecture: $ARCH"
+          echo "APT package architecture: $APT_ARCH"
+
           if [ -n "$KERNEL_VERSION" ]; then
+            # Validate common flavor mismatches early for clearer failures.
+            if [ "$APT_ARCH" = "armhf" ] && echo "$KERNEL_VERSION" | grep -Eq -- '-rpi-v8$|-rpi-2712$'; then
+              REASON="architecture '$ARCH' and kernel_version '$KERNEL_VERSION' do not match"
+              echo "::notice::$REASON. Skipping this matrix job."
+              echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
+              echo "|--------|------|--------|------|" >> "$SUMMARY"
+              echo "| $KERNEL_VERSION | $ARCH | SKIP | $REASON |" >> "$SUMMARY"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
+              echo "skip_arch=$ARCH" >> "$GITHUB_OUTPUT"
+              echo "skip_kernel=$KERNEL_VERSION" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
             # Download arch-specific headers
-            apt download linux-headers-$KERNEL_VERSION:$ARCH || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION:$ARCH" && exit 1)
+            apt download linux-headers-$KERNEL_VERSION:$APT_ARCH || (echo "::error::Failed to download linux-headers-$KERNEL_VERSION:$APT_ARCH (matrix arch=$ARCH)" && exit 1)
             # Extract base version for common headers (e.g., 6.12.75+rpt)
             BASE_VERSION=$(echo "$KERNEL_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
             COMMON_PKG="linux-headers-${BASE_VERSION}-common-rpi"
             KBUILD_PKG="linux-kbuild-${BASE_VERSION}"
             # Try to download common headers for arch, fallback to 'all' if not found
-            if ! apt download "$COMMON_PKG:$ARCH"; then
+            if ! apt download "$COMMON_PKG:$APT_ARCH"; then
               echo "::notice::Falling back to $COMMON_PKG (arch: all)"
               if ! apt download "$COMMON_PKG"; then
-                echo "::error::Failed to download $COMMON_PKG:$ARCH or $COMMON_PKG (all)" && exit 1
+                echo "::error::Failed to download $COMMON_PKG:$APT_ARCH or $COMMON_PKG (all)" && exit 1
               fi
             fi
             # Download kbuild tools for the HOST architecture (fixdep runs on the CI runner).
@@ -119,14 +167,19 @@ jobs:
           else
             # Autodetect latest kernel_count versions using apt list
             # Match any major version, restrict to valid RPi kernel version patterns (e.g., 6.1.21+rpt, 7.0.0+rpt, etc)
-            apt list -a 2>/dev/null | grep linux-headers | grep :$ARCH | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?\+rpt[^ ]*' | sort -uV | tail -n $COUNT > kernel_versions.txt
+            apt list -a 2>/dev/null | grep linux-headers | grep :$APT_ARCH | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?\+rpt[^ ]*' | sort -uV | tail -n $COUNT > kernel_versions.txt
             echo "Detected kernel versions:"; cat kernel_versions.txt
           fi
           echo "== Downloaded .deb files =="
           ls -lh $GITHUB_WORKSPACE/*.deb || echo "No debs found"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=" >> "$GITHUB_OUTPUT"
+          echo "skip_arch=$ARCH" >> "$GITHUB_OUTPUT"
+          echo "skip_kernel=${KERNEL_VERSION:-auto}" >> "$GITHUB_OUTPUT"
 
       - name: Set kernel versions for build
         id: kernels
+        if: steps.download_headers.outputs.skip != 'true'
         run: |
           set -e
           cat kernel_versions.txt | jq -R . | jq -s -c . > kernel_versions.json
@@ -134,6 +187,7 @@ jobs:
 
       - name: Build against kernels
         id: build
+        if: steps.download_headers.outputs.skip != 'true'
         working-directory: ${{ inputs.module_path }}
         continue-on-error: true
         run: |
@@ -347,8 +401,8 @@ jobs:
           echo "MODULE_NAME=$(cat MODULE_NAME)" >> $GITHUB_ENV
 
       - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v5
+        if: always() && steps.download_headers.outputs.skip != 'true'
+        uses: actions/upload-artifact@v6
         with:
           name: ko-${{ matrix.arch }}
           path: artifacts/${{ matrix.arch }}/
@@ -362,8 +416,13 @@ jobs:
             echo "::notice::No summary generated (build did not reach build step)"
           fi
 
+      - name: Show skip notice
+        if: steps.download_headers.outputs.skip == 'true'
+        run: |
+          echo "::notice::SKIPPED: arch=${{ steps.download_headers.outputs.skip_arch }}, kernel=${{ steps.download_headers.outputs.skip_kernel }}. ${{ steps.download_headers.outputs.skip_reason }}"
+
       - name: Fail with context
-        if: steps.build.outcome == 'failure'
+        if: steps.download_headers.outputs.skip != 'true' && steps.build.outcome == 'failure'
         run: |
           echo "::error::❌ One or more builds failed for arch ${{ matrix.arch }}"
           exit 1
