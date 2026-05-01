@@ -7,6 +7,14 @@ on:
         required: false
         type: number
         default: 1
+      expected_target_count:
+        required: false
+        type: number
+        default: 0
+      dry_run:
+        required: false
+        type: boolean
+        default: false
       release_lines:
         required: false
         type: string
@@ -64,19 +72,23 @@ jobs:
           EXPLICIT_VERSIONS="${{ inputs.kernel_versions }}"
           EXPLICIT_LINES="${{ inputs.release_lines }}"
           NEWEST_LINES_COUNT="${{ inputs.newest_lines_count }}"
+          EXPECTED_TARGET_COUNT="${{ inputs.expected_target_count }}"
+          DRY_RUN="${{ inputs.dry_run }}"
           HOST_ARCH="$(dpkg --print-architecture)"
 
           echo "Host architecture: $HOST_ARCH"
-          echo "Selection inputs: newest_lines_count=$NEWEST_LINES_COUNT release_lines='${EXPLICIT_LINES:-}' kernel_versions='${EXPLICIT_VERSIONS:-}'"
+          echo "Selection inputs: newest_lines_count=$NEWEST_LINES_COUNT expected_target_count=$EXPECTED_TARGET_COUNT dry_run=$DRY_RUN release_lines='${EXPLICIT_LINES:-}' kernel_versions='${EXPLICIT_VERSIONS:-}'"
 
           rm -f candidates.txt selected_targets.txt kernel_targets.txt
 
           # Collect candidate header packages from both Raspberry Pi and Ubuntu raspi flavors.
-          apt list -a 2>/dev/null | awk -F/ '
+          apt list -a 'linux-headers-*' 2>/dev/null | awk '
             /^linux-headers-[0-9]/ {
-              pkg=$1
+              split($1, path, "/")
+              pkg=path[1]
               sub(/^linux-headers-/, "", pkg)
-              arch=$NF
+              arch=$3
+              if (arch !~ /^(arm64|armhf)$/) next
               if (pkg !~ /^[0-9]+\.[0-9]+\.[0-9]+/) next
 
               family=""
@@ -100,6 +112,8 @@ jobs:
             REASON="no kernel headers were discovered in apt metadata"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+            echo "selected_target_count=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -159,6 +173,28 @@ jobs:
             REASON="kernel selection produced no targets"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+            echo "selected_target_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SELECTED_TARGET_COUNT="$(wc -l < selected_targets.txt | tr -d ' ')"
+          [ -z "$SELECTED_TARGET_COUNT" ] && SELECTED_TARGET_COUNT=0
+
+          if [ "$EXPECTED_TARGET_COUNT" -gt 0 ] && [ "$SELECTED_TARGET_COUNT" -ne "$EXPECTED_TARGET_COUNT" ]; then
+            echo "::error::Target selection mismatch: expected=$EXPECTED_TARGET_COUNT selected=$SELECTED_TARGET_COUNT"
+            echo "Selected kernel targets (kver|arch|pkg|family|core|line):"
+            cat selected_targets.txt || true
+            exit 1
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry-run selected kernel targets (kver|arch|pkg|family|core|line):"
+            cat selected_targets.txt
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=dry-run mode enabled" >> "$GITHUB_OUTPUT"
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+            echo "selected_target_count=$SELECTED_TARGET_COUNT" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -215,6 +251,8 @@ jobs:
             REASON="no kernels passed package download checks"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+            echo "selected_target_count=$SELECTED_TARGET_COUNT" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -227,6 +265,8 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE"/*.deb || echo "No debs found"
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "skip_reason=" >> "$GITHUB_OUTPUT"
+          echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          echo "selected_target_count=$SELECTED_TARGET_COUNT" >> "$GITHUB_OUTPUT"
 
       - name: Build against kernels
         id: build
@@ -462,6 +502,13 @@ jobs:
       - name: Show final status
         if: always()
         run: |
+          if [ "${{ steps.download_headers.outputs.dry_run }}" = "true" ]; then
+            SELECTED="${{ steps.download_headers.outputs.selected_target_count }}"
+            [ -z "$SELECTED" ] && SELECTED=0
+            echo "::notice::DRY-RUN: selected_targets=$SELECTED"
+            exit 0
+          fi
+
           if [ "${{ steps.download_headers.outputs.skip }}" = "true" ]; then
             echo "::warning::SKIP: ${{ steps.download_headers.outputs.skip_reason }}"
             exit 0
