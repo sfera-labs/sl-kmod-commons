@@ -45,6 +45,8 @@ jobs:
           sudo apt install -y build-essential jq curl xz-utils gnupg gcc-12 device-tree-compiler
           # Keep armhf cross toolchain available for targets inferred as 32-bit ARM.
           sudo apt install -y gcc-12-arm-linux-gnueabihf
+          # Some RPi armhf header trees invoke gcc-14 explicitly.
+          sudo apt install -y gcc-14-arm-linux-gnueabihf
 
       - name: Enable package architectures for apt
         run: |
@@ -65,21 +67,55 @@ jobs:
               || curl -fsSI "http://archive.raspberrypi.org/debian/dists/$suite/Release" >/dev/null
           }
 
-          CODENAME="$(curl -fsSL "$DISTRO_INFO_URL" | awk -F',' -v today="$TODAY" 'NR > 1 && $5 != "" && $5 <= today { if ($5 > max) { max=$5; code=tolower($2) } } END { print code }')"
-          CODENAME_SOURCE="debian-distro-info"
-          if [ -z "$CODENAME" ] || ! repo_suite_exists "$CODENAME"; then
-            CODENAME="trixie"
-            CODENAME_SOURCE="fallback-trixie"
-            echo "::warning::Failed to resolve a valid Raspberry Pi repository codename from distro-info; falling back to '$CODENAME'"
+          DISTRO_INFO="$(curl -fsSL "$DISTRO_INFO_URL" || true)"
+
+          STABLE_SUITE=""
+          OLDSTABLE_SUITE=""
+          NEXT_SUITE=""
+          SUITE_SOURCE="debian-distro-info"
+
+          if [ -n "$DISTRO_INFO" ]; then
+            STABLE_SUITE="$(printf '%s\n' "$DISTRO_INFO" | awk -F',' -v today="$TODAY" 'NR > 1 && $5 != "" && $5 <= today { if ($5 > max) { max=$5; code=tolower($2) } } END { print code }')"
+            OLDSTABLE_SUITE="$(printf '%s\n' "$DISTRO_INFO" | awk -F',' -v today="$TODAY" 'NR > 1 && $5 != "" && $5 <= today { print $5 "," tolower($2) }' | sort -t',' -k1,1 | tail -n2 | head -n1 | cut -d',' -f2)"
+            NEXT_SUITE="$(printf '%s\n' "$DISTRO_INFO" | awk -F',' -v today="$TODAY" 'NR > 1 && $5 != "" && $5 > today { if (min == "" || $5 < min) { min=$5; code=tolower($2) } } END { print code }')"
           fi
 
-          if ! repo_suite_exists "$CODENAME"; then
-            echo "::error::Raspberry Pi repository suite '$CODENAME' is not available (InRelease/Release missing)"
+          if [ -z "$STABLE_SUITE" ]; then
+            STABLE_SUITE="trixie"
+            SUITE_SOURCE="fallback-trixie"
+            echo "::warning::Failed to resolve stable Debian suite from distro-info; falling back to '$STABLE_SUITE'"
+          fi
+
+          CANDIDATE_SUITES_RAW="$STABLE_SUITE $OLDSTABLE_SUITE $NEXT_SUITE"
+          ENABLED_SUITES=""
+          SEEN_SUITES=" "
+          for suite in $CANDIDATE_SUITES_RAW; do
+            suite="$(echo "$suite" | xargs | tr '[:upper:]' '[:lower:]')"
+            [ -z "$suite" ] && continue
+            case " $SEEN_SUITES " in
+              *" $suite "*)
+                continue
+                ;;
+            esac
+            SEEN_SUITES="$SEEN_SUITES$suite "
+
+            if repo_suite_exists "$suite"; then
+              ENABLED_SUITES="${ENABLED_SUITES:+$ENABLED_SUITES }$suite"
+            else
+              echo "::warning::Skipping unavailable Raspberry Pi suite '$suite' (InRelease/Release missing)"
+            fi
+          done
+
+          if [ -z "$ENABLED_SUITES" ]; then
+            echo "::error::No usable Raspberry Pi repository suites were found"
             exit 1
           fi
 
-          echo "Resolved Raspberry Pi repository codename: $CODENAME (source: $CODENAME_SOURCE)"
-          echo "deb http://archive.raspberrypi.org/debian/ $CODENAME main" | sudo tee /etc/apt/sources.list.d/raspi.list
+          echo "Resolved Raspberry Pi suites: $ENABLED_SUITES (stable=$STABLE_SUITE oldstable=${OLDSTABLE_SUITE:-n/a} next=${NEXT_SUITE:-n/a} source=$SUITE_SOURCE)"
+          : | sudo tee /etc/apt/sources.list.d/raspi.list >/dev/null
+          for suite in $ENABLED_SUITES; do
+            echo "deb http://archive.raspberrypi.org/debian/ $suite main" | sudo tee -a /etc/apt/sources.list.d/raspi.list
+          done
           curl -fsSL https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/raspberrypi.gpg
           sudo apt-get update --allow-releaseinfo-change
 
@@ -391,6 +427,9 @@ jobs:
           FAILS=0
           SKIPS=0
           TARGETS=0
+          OK_KERNELS=""
+          FAIL_KERNELS=""
+          SKIP_KERNELS=""
           ARTIFACT_ROOT="${RUNNER_TEMP}/kmod-artifacts"
 
           # Stage artifacts outside the module tree to avoid accidental cleanup by local make targets.
@@ -409,6 +448,7 @@ jobs:
             if [ -z "$HEADERS_DEB" ] || [ ! -s "$HEADERS_DEB" ]; then
               echo "::warning::Skipping kernel $KVER: missing downloaded headers deb"
               SKIPS=$((SKIPS + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KVER"
               continue
             fi
 
@@ -420,6 +460,7 @@ jobs:
               if [ -z "$COMMON_DEB" ] || [ ! -s "$COMMON_DEB" ]; then
                 echo "::warning::Skipping kernel $KVER: missing common headers deb"
                 SKIPS=$((SKIPS + 1))
+                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KVER"
                 continue
               fi
             fi
@@ -433,6 +474,7 @@ jobs:
             if [ -z "$KBUILD_DEB" ] || [ ! -s "$KBUILD_DEB" ]; then
               echo "::warning::Skipping kernel $KVER: missing host kbuild deb"
               SKIPS=$((SKIPS + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KVER"
               continue
             fi
 
@@ -444,6 +486,7 @@ jobs:
               echo "::error::Kernel $KVER failed: kbuild package architecture does not match host"
               FAIL=1
               FAILS=$((FAILS + 1))
+              FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KVER"
               continue
             fi
 
@@ -452,16 +495,19 @@ jobs:
             if ! dpkg-deb -x "$HEADERS_DEB" root/; then
               echo "::warning::Skipping kernel $KVER: failed to extract headers"
               SKIPS=$((SKIPS + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KVER"
               continue
             fi
             if [ -n "$COMMON_DEB" ] && ! dpkg-deb -x "$COMMON_DEB" root/; then
               echo "::warning::Skipping kernel $KVER: failed to extract common headers"
               SKIPS=$((SKIPS + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KVER"
               continue
             fi
             if ! dpkg-deb -x "$KBUILD_DEB" root/; then
               echo "::warning::Skipping kernel $KVER: failed to extract kbuild"
               SKIPS=$((SKIPS + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KVER"
               continue
             fi
 
@@ -499,6 +545,7 @@ jobs:
               *)
                 echo "::warning::Skipping kernel $KVER: unsupported inferred package architecture '$APT_ARCH'"
                 SKIPS=$((SKIPS + 1))
+                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KVER"
                 continue
                 ;;
             esac
@@ -513,6 +560,7 @@ jobs:
             if [ -z "$HDRDIR" ]; then
               echo "::warning::Skipping kernel $KVER: specific headers directory missing"
               SKIPS=$((SKIPS + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KVER"
               continue
             fi
             KDIR="$GITHUB_WORKSPACE/root/usr/src/$HDRDIR"
@@ -551,6 +599,7 @@ jobs:
               echo "::error::Kernel $KVER failed: compiler not found ($CC_BIN)"
               FAIL=1
               FAILS=$((FAILS + 1))
+              FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KVER"
               continue
             fi
             "$CC_BIN" --version || true
@@ -580,14 +629,17 @@ jobs:
                 echo "::error::Kernel $KVER failed: expected .ko and .dtbo outputs are required"
                 FAIL=1
                 FAILS=$((FAILS + 1))
+                FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KVER"
               else
                 echo "Build OK for kernel $KVER"
                 OKS=$((OKS + 1))
+                OK_KERNELS="${OK_KERNELS:+$OK_KERNELS,}$KVER"
               fi
             else
               echo "::error::Kernel $KVER failed: make returned non-zero"
               FAIL=1
               FAILS=$((FAILS + 1))
+              FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KVER"
             fi
 
             if [ "$KO_COUNT" -gt 0 ] && [ "$DTBO_COUNT" -gt 0 ]; then
@@ -609,6 +661,9 @@ jobs:
           echo "ok_count=$OKS" >> "$GITHUB_OUTPUT"
           echo "skip_count=$SKIPS" >> "$GITHUB_OUTPUT"
           echo "fail_count=$FAILS" >> "$GITHUB_OUTPUT"
+          echo "ok_kernels=$OK_KERNELS" >> "$GITHUB_OUTPUT"
+          echo "fail_kernels=$FAIL_KERNELS" >> "$GITHUB_OUTPUT"
+          echo "skip_kernels=$SKIP_KERNELS" >> "$GITHUB_OUTPUT"
           exit $FAIL
 
       - name: Upload artifacts
@@ -651,10 +706,23 @@ jobs:
           OKS="${{ steps.build.outputs.ok_count }}"
           SKIPS="${{ steps.build.outputs.skip_count }}"
           FAILS="${{ steps.build.outputs.fail_count }}"
+          OK_KERNELS="${{ steps.build.outputs.ok_kernels }}"
+          FAIL_KERNELS="${{ steps.build.outputs.fail_kernels }}"
+          SKIP_KERNELS="${{ steps.build.outputs.skip_kernels }}"
           [ -z "$TARGETS" ] && TARGETS=0
           [ -z "$OKS" ] && OKS=0
           [ -z "$SKIPS" ] && SKIPS=0
           [ -z "$FAILS" ] && FAILS=0
+
+          if [ -n "$OK_KERNELS" ]; then
+            echo "::notice::Succeeded kernels: $OK_KERNELS"
+          fi
+          if [ -n "$FAIL_KERNELS" ]; then
+            echo "::error::Failed kernels: $FAIL_KERNELS"
+          fi
+          if [ -n "$SKIP_KERNELS" ]; then
+            echo "::warning::Skipped kernels: $SKIP_KERNELS"
+          fi
 
           if [ "$FAILS" -gt 0 ]; then
             echo "::error::FAIL: targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS"
