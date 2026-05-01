@@ -113,10 +113,7 @@ jobs:
               ;;
             *)
               REASON="Unsupported target arch '$ARCH' (supported: arm64, armhf, arm)"
-              echo "::notice::$REASON. Skipping this matrix job."
-              echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
-              echo "|--------|------|--------|------|" >> "$SUMMARY"
-              echo "| ${KERNEL_VERSION:-n/a} | $ARCH | SKIP | $REASON |" >> "$SUMMARY"
+              echo "WARN|SKIP|arch=$ARCH|kernel=${KERNEL_VERSION:-auto}|reason=$REASON" > "$SUMMARY"
               echo "skip=true" >> "$GITHUB_OUTPUT"
               echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
               echo "skip_arch=$ARCH" >> "$GITHUB_OUTPUT"
@@ -133,10 +130,7 @@ jobs:
             # Validate common flavor mismatches early for clearer failures.
             if [ "$APT_ARCH" = "armhf" ] && echo "$KERNEL_VERSION" | grep -Eq -- '-rpi-v8$|-rpi-2712$'; then
               REASON="architecture '$ARCH' and kernel_version '$KERNEL_VERSION' do not match"
-              echo "::notice::$REASON. Skipping this matrix job."
-              echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
-              echo "|--------|------|--------|------|" >> "$SUMMARY"
-              echo "| $KERNEL_VERSION | $ARCH | SKIP | $REASON |" >> "$SUMMARY"
+              echo "WARN|SKIP|arch=$ARCH|kernel=$KERNEL_VERSION|reason=$REASON" > "$SUMMARY"
               echo "skip=true" >> "$GITHUB_OUTPUT"
               echo "skip_reason=$REASON" >> "$GITHUB_OUTPUT"
               echo "skip_arch=$ARCH" >> "$GITHUB_OUTPUT"
@@ -198,8 +192,7 @@ jobs:
           ARCH="${{ matrix.arch }}"
           HOST_ARCH="$(dpkg --print-architecture)"
           echo "Runner host architecture in build step: $HOST_ARCH"
-          echo "| Kernel | Arch | Result | Note |" > "$SUMMARY"
-          echo "|--------|------|--------|------|" >> "$SUMMARY"
+          : > "$SUMMARY"
 
           # Clean up and create extraction root ONCE per build
           rm -rf root
@@ -217,7 +210,7 @@ jobs:
             echo "Preparing to extract: $HEADERS_DEB, $COMMON_DEB and $KBUILD_DEB"
             if [ ! -s "$HEADERS_DEB" ] || [ ! -s "$COMMON_DEB" ] || [ ! -s "$KBUILD_DEB" ]; then
               echo "❌ Downloaded package deb not found or empty: $HEADERS_DEB $COMMON_DEB $KBUILD_DEB"
-              echo "| $HEADERS_DEB $COMMON_DEB $KBUILD_DEB | $ARCH | SKIP | download failed |" >> "$SUMMARY"
+              echo "WARN|SKIP|arch=$ARCH|kernel=$KVER|reason=download failed" >> "$SUMMARY"
               continue
             fi
 
@@ -225,7 +218,7 @@ jobs:
             echo "Selected kbuild deb architecture: ${KBUILD_DEB_ARCH:-unknown} (host: $HOST_ARCH)"
             if [ "$KBUILD_DEB_ARCH" != "$HOST_ARCH" ] && [ "$KBUILD_DEB_ARCH" != "all" ]; then
               echo "❌ Selected kbuild .deb arch ($KBUILD_DEB_ARCH) does not match host arch ($HOST_ARCH)"
-              echo "| $KBUILD_DEB | $ARCH | FAIL | kbuild arch mismatch host=$HOST_ARCH pkg=$KBUILD_DEB_ARCH |" >> "$SUMMARY"
+              echo "ERROR|FAIL|arch=$ARCH|kernel=$KVER|reason=kbuild arch mismatch host=$HOST_ARCH pkg=$KBUILD_DEB_ARCH" >> "$SUMMARY"
               FAIL=1
               continue
             fi
@@ -233,17 +226,17 @@ jobs:
             mkdir root
             if ! dpkg-deb -x "$HEADERS_DEB" root/; then
               echo "❌ Failed to extract $HEADERS_DEB"
-              echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | extract failed |" >> "$SUMMARY"
+              echo "WARN|SKIP|arch=${{ matrix.arch }}|kernel=$KVER|reason=extract failed ($HEADERS_DEB)" >> "$SUMMARY"
               continue
             fi
             if ! dpkg-deb -x "$COMMON_DEB" root/; then
               echo "❌ Failed to extract $COMMON_DEB"
-              echo "| $COMMON_DEB | $ARCH | SKIP | extract failed |" >> "$SUMMARY"
+              echo "WARN|SKIP|arch=$ARCH|kernel=$KVER|reason=extract failed ($COMMON_DEB)" >> "$SUMMARY"
               continue
             fi
             if ! dpkg-deb -x "$KBUILD_DEB" root/; then
               echo "❌ Failed to extract $KBUILD_DEB"
-              echo "| $KBUILD_DEB | $ARCH | SKIP | extract failed |" >> "$SUMMARY"
+              echo "WARN|SKIP|arch=$ARCH|kernel=$KVER|reason=extract failed ($KBUILD_DEB)" >> "$SUMMARY"
               continue
             fi
 
@@ -289,7 +282,7 @@ jobs:
             # Check for common headers directory
             if [ ! -d "root/usr/src/linux-headers-${BASE_VERSION}-common-rpi" ]; then
               echo "❌ Common headers directory missing after extraction!"
-              echo "| $HEADERS_DEB $COMMON_DEB | $ARCH | SKIP | no common headers dir |" >> "$SUMMARY"
+              echo "WARN|SKIP|arch=$ARCH|kernel=$KVER|reason=no common headers dir" >> "$SUMMARY"
               continue
             fi
 
@@ -297,7 +290,7 @@ jobs:
             HDRDIR=$(ls root/usr/src | grep "linux-headers-$KVER" || true)
             if [ -z "$HDRDIR" ]; then
               echo "❌ Arch/flavor-specific linux-headers directory not found after extracting $HEADERS_DEB and $COMMON_DEB"
-              echo "| $HEADERS_DEB $COMMON_DEB | $ARCH | SKIP | no specific headers dir |" >> "$SUMMARY"
+              echo "WARN|SKIP|arch=$ARCH|kernel=$KVER|reason=no specific headers dir" >> "$SUMMARY"
               continue
             fi
             KDIR="$GITHUB_WORKSPACE/root/usr/src/$HDRDIR"
@@ -329,7 +322,7 @@ jobs:
             echo "Selected compiler binary: $CC_BIN"
             if ! command -v "$CC_BIN" >/dev/null 2>&1; then
               echo "❌ Compiler not found: $CC_BIN"
-              echo "| $HDRDIR | $ARCH | FAIL | missing compiler $CC_BIN |" >> "$SUMMARY"
+              echo "ERROR|FAIL|arch=$ARCH|kernel=$KVER|reason=missing compiler $CC_BIN" >> "$SUMMARY"
               FAIL=1
               continue
             fi
@@ -362,19 +355,23 @@ jobs:
               else
                 echo "✅ Build OK"
                 RESULT="OK"
-                NOTE=""
+                NOTE="ko+dtbo generated"
               fi
             else
               echo "❌ Build failed"
               RESULT="FAIL"
-              NOTE=""
+              NOTE="make failed"
               FAIL=1
             fi
 
-            echo "| $HDRDIR | $ARCH | $RESULT | $NOTE |" >> "$SUMMARY"
+            if [ "$RESULT" = "OK" ]; then
+              echo "OK|PASS|arch=$ARCH|kernel=$KVER|reason=$NOTE" >> "$SUMMARY"
+            else
+              echo "ERROR|FAIL|arch=$ARCH|kernel=$KVER|reason=$NOTE" >> "$SUMMARY"
+            fi
 
             if [ "$RESULT" = "OK" ]; then
-              OUT="$GITHUB_WORKSPACE/artifacts/$ARCH/$HDRDIR"
+              OUT="$GITHUB_WORKSPACE/artifacts/$ARCH/module-artifacts-$KVER"
               mkdir -p "$OUT"
               find . -maxdepth 1 -type f -name '*.ko' -print -exec cp -v {} "$OUT/" \;
               find . -maxdepth 1 -type f -name '*.dtbo' -print -exec cp -v {} "$OUT/" \;
@@ -382,12 +379,13 @@ jobs:
           done < kernel_versions.txt
 
           echo ""
-          OKS=$(grep -c '|.*|.*| OK |' "$SUMMARY" || true)
-          FAILS=$(grep -c '|.*|.*| FAIL |' "$SUMMARY" || true)
+          OKS=$(grep -c '^OK|' "$SUMMARY" || true)
+          FAILS=$(grep -c '^ERROR|' "$SUMMARY" || true)
+          SKIPS=$(grep -c '^WARN|SKIP|' "$SUMMARY" || true)
           echo "========== BUILD SUMMARY =========="
           cat "$SUMMARY"
           echo "=================================="
-          echo "Total builds: $((OKS+FAILS)), OK: $OKS, FAIL: $FAILS"
+          echo "Total builds: $((OKS+FAILS+SKIPS)), OK: $OKS, SKIP: $SKIPS, FAIL: $FAILS"
           exit $FAIL
 
       - name: Detect module name
@@ -404,22 +402,40 @@ jobs:
         if: always() && steps.download_headers.outputs.skip != 'true'
         uses: actions/upload-artifact@v6
         with:
-          name: ko-${{ matrix.arch }}
+          name: kmod-artifacts-${{ matrix.arch }}
           path: artifacts/${{ matrix.arch }}/
 
-      - name: Show build summary
+      - name: Show final status
         if: always()
         run: |
-          if [ -f "$GITHUB_WORKSPACE/summary.txt" ]; then
-            echo "::notice file=summary.txt::$(cat $GITHUB_WORKSPACE/summary.txt)"
-          else
-            echo "::notice::No summary generated (build did not reach build step)"
+          ARCH="${{ matrix.arch }}"
+          KERNEL_HINT="${{ inputs.kernel_version }}"
+          if [ -z "$KERNEL_HINT" ]; then
+            KERNEL_HINT="auto"
           fi
 
-      - name: Show skip notice
-        if: steps.download_headers.outputs.skip == 'true'
-        run: |
-          echo "::notice::SKIPPED: arch=${{ steps.download_headers.outputs.skip_arch }}, kernel=${{ steps.download_headers.outputs.skip_kernel }}. ${{ steps.download_headers.outputs.skip_reason }}"
+          if [ "${{ steps.download_headers.outputs.skip }}" = "true" ]; then
+            echo "::warning::[SKIP][warning] arch=${{ steps.download_headers.outputs.skip_arch }} kernel=${{ steps.download_headers.outputs.skip_kernel }} reason=${{ steps.download_headers.outputs.skip_reason }}"
+            exit 0
+          fi
+
+          SUMMARY="$GITHUB_WORKSPACE/summary.txt"
+          if [ ! -f "$SUMMARY" ]; then
+            echo "::notice::[INFO][info] arch=$ARCH kernel=$KERNEL_HINT no summary generated"
+            exit 0
+          fi
+
+          OKS=$(grep -c '^OK|' "$SUMMARY" || true)
+          FAILS=$(grep -c '^ERROR|' "$SUMMARY" || true)
+          SKIPS=$(grep -c '^WARN|SKIP|' "$SUMMARY" || true)
+
+          if [ "$FAILS" -gt 0 ]; then
+            echo "::error::[FAIL][negative] arch=$ARCH kernel=$KERNEL_HINT ok=$OKS skip=$SKIPS fail=$FAILS"
+          elif [ "$OKS" -gt 0 ]; then
+            echo "::notice::[OK][positive] arch=$ARCH kernel=$KERNEL_HINT ok=$OKS skip=$SKIPS fail=$FAILS artifacts=.ko+.dtbo"
+          else
+            echo "::warning::[WARN][warning] arch=$ARCH kernel=$KERNEL_HINT ok=$OKS skip=$SKIPS fail=$FAILS"
+          fi
 
       - name: Fail with context
         if: steps.download_headers.outputs.skip != 'true' && steps.build.outcome == 'failure'
