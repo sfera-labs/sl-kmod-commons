@@ -203,6 +203,14 @@ jobs:
           echo "Selected kernel targets (kver|arch|pkg|family|core|line):"
           cat selected_targets.txt
 
+          RPI_SELECTED_COUNT="$(awk -F'|' '$4 == "rpi" { c++ } END { print c+0 }' selected_targets.txt)"
+          UBUNTU_SELECTED_COUNT="$(awk -F'|' '$4 == "ubuntu" { c++ } END { print c+0 }' selected_targets.txt)"
+          echo "Selected families: rpi=$RPI_SELECTED_COUNT ubuntu=$UBUNTU_SELECTED_COUNT"
+          if [ "$RPI_SELECTED_COUNT" -eq 0 ] || [ "$UBUNTU_SELECTED_COUNT" -eq 0 ]; then
+            echo "::error::Kernel selection must include both families: rpi=$RPI_SELECTED_COUNT ubuntu=$UBUNTU_SELECTED_COUNT"
+            exit 1
+          fi
+
           while IFS='|' read -r KVER APT_ARCH HEADER_PKG FAMILY CORE LINE; do
             [ -z "$KVER" ] && continue
 
@@ -264,6 +272,14 @@ jobs:
           echo "Selected build targets (kver|arch|pkg|family|core|line):"
           cat kernel_targets.txt
 
+          RPI_BUILD_TARGET_COUNT="$(awk -F'|' '$4 == "rpi" { c++ } END { print c+0 }' kernel_targets.txt)"
+          UBUNTU_BUILD_TARGET_COUNT="$(awk -F'|' '$4 == "ubuntu" { c++ } END { print c+0 }' kernel_targets.txt)"
+          echo "Build-target families: rpi=$RPI_BUILD_TARGET_COUNT ubuntu=$UBUNTU_BUILD_TARGET_COUNT"
+          if [ "$RPI_BUILD_TARGET_COUNT" -eq 0 ] || [ "$UBUNTU_BUILD_TARGET_COUNT" -eq 0 ]; then
+            echo "::error::Build target set must include both families after package checks: rpi=$RPI_BUILD_TARGET_COUNT ubuntu=$UBUNTU_BUILD_TARGET_COUNT"
+            exit 1
+          fi
+
           echo "== Downloaded .deb files =="
           ls -lh "$GITHUB_WORKSPACE"/*.deb || echo "No debs found"
           echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -286,6 +302,11 @@ jobs:
           FAILS=0
           SKIPS=0
           TARGETS=0
+          ARTIFACT_ROOT="${RUNNER_TEMP}/kmod-artifacts"
+
+          # Stage artifacts outside the module tree to avoid accidental cleanup by local make targets.
+          rm -rf "$ARTIFACT_ROOT"
+          mkdir -p "$ARTIFACT_ROOT"
 
           # Clean up and create extraction root ONCE per build
           rm -rf root
@@ -481,12 +502,18 @@ jobs:
             fi
 
             if [ "$KO_COUNT" -gt 0 ] && [ "$DTBO_COUNT" -gt 0 ]; then
-              OUT="$GITHUB_WORKSPACE/artifacts/$APT_ARCH/module-artifacts-$KVER"
+              OUT="$ARTIFACT_ROOT/$APT_ARCH/module-artifacts-$KVER"
               mkdir -p "$OUT"
               find . -maxdepth 1 -type f -name '*.ko' -print -exec cp -v {} "$OUT/" \;
               find . -maxdepth 1 -type f -name '*.dtbo' -print -exec cp -v {} "$OUT/" \;
             fi
           done < "$GITHUB_WORKSPACE/kernel_targets.txt"
+
+          echo "== Staged artifact files =="
+          find "$ARTIFACT_ROOT" -type f | sort || true
+          STAGED_ARTIFACT_COUNT="$(find "$ARTIFACT_ROOT" -type f | wc -l | tr -d ' ')"
+          [ -z "$STAGED_ARTIFACT_COUNT" ] && STAGED_ARTIFACT_COUNT=0
+          echo "Staged artifact file count: $STAGED_ARTIFACT_COUNT"
 
           echo "Total builds: $((OKS+FAILS+SKIPS)), OK: $OKS, SKIP: $SKIPS, FAIL: $FAILS"
           echo "target_count=$TARGETS" >> "$GITHUB_OUTPUT"
@@ -500,7 +527,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: kmod-artifacts
-          path: artifacts/
+          path: ${{ runner.temp }}/kmod-artifacts/
 
       - name: Show final status
         if: always()
