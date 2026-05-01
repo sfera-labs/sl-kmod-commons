@@ -39,8 +39,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          # Install build tools and cross-compilers for both 64-bit and 32-bit Pi
-          sudo apt install -y build-essential jq curl xz-utils gnupg gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+          # Install build tools and gcc-12 cross-compilers expected by RPi kernel headers
+          sudo apt install -y build-essential jq curl xz-utils gnupg gcc-12-aarch64-linux-gnu gcc-12-arm-linux-gnueabihf
 
       - name: Enable arm64 architecture for apt
         run: |
@@ -68,6 +68,7 @@ jobs:
             # Extract base version for common headers (e.g., 6.12.75+rpt)
             BASE_VERSION=$(echo "$KERNEL_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
             COMMON_PKG="linux-headers-${BASE_VERSION}-common-rpi"
+            KBUILD_PKG="linux-kbuild-${BASE_VERSION}"
             # Try to download common headers for arch, fallback to 'all' if not found
             if ! apt download "$COMMON_PKG:$ARCH"; then
               echo "::notice::Falling back to $COMMON_PKG (arch: all)"
@@ -75,6 +76,8 @@ jobs:
                 echo "::error::Failed to download $COMMON_PKG:$ARCH or $COMMON_PKG (all)" && exit 1
               fi
             fi
+            # Download matching kbuild package required by scripts symlinks in common headers
+            apt download "$KBUILD_PKG:$ARCH" || (echo "::error::Failed to download $KBUILD_PKG:$ARCH" && exit 1)
             echo "$KERNEL_VERSION" > kernel_versions.txt
           else
             # Autodetect latest kernel_count versions using apt list
@@ -113,10 +116,11 @@ jobs:
             HEADERS_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-$KVER*.deb | grep -v common | head -n1)
             BASE_VERSION=$(echo "$KVER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt')
             COMMON_DEB=$(ls $GITHUB_WORKSPACE/linux-headers-${BASE_VERSION}-common-rpi*.deb | head -n1)
-            echo "Preparing to extract: $HEADERS_DEB and $COMMON_DEB"
-            if [ ! -s "$HEADERS_DEB" ] || [ ! -s "$COMMON_DEB" ]; then
-              echo "❌ Downloaded headers deb not found or empty: $HEADERS_DEB $COMMON_DEB"
-              echo "| $HEADERS_DEB $COMMON_DEB | $ARCH | SKIP | download failed |" >> "$SUMMARY"
+            KBUILD_DEB=$(ls $GITHUB_WORKSPACE/linux-kbuild-${BASE_VERSION}*.deb | head -n1)
+            echo "Preparing to extract: $HEADERS_DEB, $COMMON_DEB and $KBUILD_DEB"
+            if [ ! -s "$HEADERS_DEB" ] || [ ! -s "$COMMON_DEB" ] || [ ! -s "$KBUILD_DEB" ]; then
+              echo "❌ Downloaded package deb not found or empty: $HEADERS_DEB $COMMON_DEB $KBUILD_DEB"
+              echo "| $HEADERS_DEB $COMMON_DEB $KBUILD_DEB | $ARCH | SKIP | download failed |" >> "$SUMMARY"
               continue
             fi
             rm -rf root
@@ -126,14 +130,14 @@ jobs:
               echo "| $HEADERS_DEB | ${{ matrix.arch }} | SKIP | extract failed |" >> "$SUMMARY"
               continue
             fi
-            if ! dpkg-deb -x "$HEADERS_DEB" root/; then
-              echo "❌ Failed to extract $HEADERS_DEB"
-              echo "| $HEADERS_DEB | $ARCH | SKIP | extract failed |" >> "$SUMMARY"
-              continue
-            fi
             if ! dpkg-deb -x "$COMMON_DEB" root/; then
               echo "❌ Failed to extract $COMMON_DEB"
               echo "| $COMMON_DEB | $ARCH | SKIP | extract failed |" >> "$SUMMARY"
+              continue
+            fi
+            if ! dpkg-deb -x "$KBUILD_DEB" root/; then
+              echo "❌ Failed to extract $KBUILD_DEB"
+              echo "| $KBUILD_DEB | $ARCH | SKIP | extract failed |" >> "$SUMMARY"
               continue
             fi
             echo "== After extraction, /usr/src contains =="
@@ -152,14 +156,6 @@ jobs:
               echo "❌ Common headers directory missing after extraction!"
               echo "| $HEADERS_DEB $COMMON_DEB | $ARCH | SKIP | no common headers dir |" >> "$SUMMARY"
               continue
-            fi
-
-            # Workaround: create empty Makefile.extrawarn if missing (RPi headers bug)
-            EXTRAWARN="root/usr/src/linux-headers-${BASE_VERSION}-common-rpi/scripts/Makefile.extrawarn"
-            if [ ! -f "$EXTRAWARN" ]; then
-              echo "::warning::Missing Makefile.extrawarn, creating empty file to unblock build"
-              mkdir -p "$(dirname "$EXTRAWARN")" 2>/dev/null || true
-              touch "$EXTRAWARN"
             fi
 
             # Always use the arch/flavor-specific headers directory for building
