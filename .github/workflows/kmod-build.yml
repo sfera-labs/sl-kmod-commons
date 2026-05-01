@@ -59,18 +59,29 @@ jobs:
           set -e
           DISTRO_INFO_URL="https://salsa.debian.org/debian/distro-info-data/-/raw/main/debian.csv"
           TODAY="$(date -u +%F)"
-          CODENAME="$(curl -fsSL "$DISTRO_INFO_URL" | awk -F',' -v today="$TODAY" 'NR > 1 && $5 != "" && $5 <= today { if ($5 > max) { max=$5; code=$2 } } END { print code }')"
+          repo_suite_exists() {
+            local suite="$1"
+            curl -fsSI "http://archive.raspberrypi.org/debian/dists/$suite/InRelease" >/dev/null \
+              || curl -fsSI "http://archive.raspberrypi.org/debian/dists/$suite/Release" >/dev/null
+          }
+
+          CODENAME="$(curl -fsSL "$DISTRO_INFO_URL" | awk -F',' -v today="$TODAY" 'NR > 1 && $5 != "" && $5 <= today { if ($5 > max) { max=$5; code=tolower($2) } } END { print code }')"
           CODENAME_SOURCE="debian-distro-info"
-          if [ -z "$CODENAME" ]; then
+          if [ -z "$CODENAME" ] || ! repo_suite_exists "$CODENAME"; then
             CODENAME="trixie"
             CODENAME_SOURCE="fallback-trixie"
-            echo "::warning::Failed to resolve Debian codename from distro-info; falling back to '$CODENAME'"
+            echo "::warning::Failed to resolve a valid Raspberry Pi repository codename from distro-info; falling back to '$CODENAME'"
+          fi
+
+          if ! repo_suite_exists "$CODENAME"; then
+            echo "::error::Raspberry Pi repository suite '$CODENAME' is not available (InRelease/Release missing)"
+            exit 1
           fi
 
           echo "Resolved Raspberry Pi repository codename: $CODENAME (source: $CODENAME_SOURCE)"
           echo "deb http://archive.raspberrypi.org/debian/ $CODENAME main" | sudo tee /etc/apt/sources.list.d/raspi.list
           curl -fsSL https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/raspberrypi.gpg
-          sudo apt-get update --allow-releaseinfo-change || true
+          sudo apt-get update --allow-releaseinfo-change
 
       - name: Download kernel headers deb(s) with apt
         id: download_headers
