@@ -914,11 +914,7 @@ jobs:
               echo "fixdep path not found under extracted tree"
             fi
 
-            if [ -n "$CROSS_COMPILE" ]; then
-              CC_BIN="${CROSS_COMPILE}gcc-12"
-            else
-              CC_BIN="gcc-12"
-            fi
+            CC_BIN="$(resolve_compiler_bin "$CROSS_COMPILE")"
             echo "Selected compiler binary: $CC_BIN"
             if ! command -v "$CC_BIN" >/dev/null 2>&1; then
               echo "::error::Kernel $KVER failed: compiler not found ($CC_BIN)"
@@ -942,9 +938,9 @@ jobs:
             DTBO_COUNT=0
 
             # Keep clean non-fatal: first build on a fresh checkout may not have artifacts to clean.
-            make clean || true
+            make CC="$CC_BIN" clean || true
 
-            if make; then
+            if make CC="$CC_BIN"; then
               KO_COUNT="$(find . -maxdepth 1 -type f -name '*.ko' | wc -l | tr -d ' ')"
               DTBO_COUNT="$(find . -maxdepth 1 -type f -name '*.dtbo' | wc -l | tr -d ' ')"
               echo "Produced artifacts count: ko=$KO_COUNT dtbo=$DTBO_COUNT"
@@ -1083,10 +1079,10 @@ jobs:
 
               KO_COUNT=0
               DTBO_COUNT=0
-              make clean || true
+              make CC="$CC_BIN" clean || true
               MAKE_LOG="$RUNNER_TEMP/experimental-make-${CHANNEL}-${KVER}.log"
               rm -f "$MAKE_LOG"
-              if make 2>&1 | tee "$MAKE_LOG"; then
+              if make CC="$CC_BIN" 2>&1 | tee "$MAKE_LOG"; then
                 KO_COUNT="$(find . -maxdepth 1 -type f -name '*.ko' | wc -l | tr -d ' ')"
                 DTBO_COUNT="$(find . -maxdepth 1 -type f -name '*.dtbo' | wc -l | tr -d ' ')"
                 if [ "$KO_COUNT" -eq 0 ] || [ "$DTBO_COUNT" -eq 0 ]; then
