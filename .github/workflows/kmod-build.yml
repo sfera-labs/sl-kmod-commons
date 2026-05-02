@@ -56,6 +56,15 @@ jobs:
           # Some RPi armhf header trees invoke gcc-14 explicitly.
           sudo apt install -y gcc-14-arm-linux-gnueabihf
 
+          # Some kernel Kconfig checks expect an unversioned cross-compiler name.
+          if ! command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
+            if command -v arm-linux-gnueabihf-gcc-12 >/dev/null 2>&1; then
+              sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-12)" /usr/local/bin/arm-linux-gnueabihf-gcc
+            elif command -v arm-linux-gnueabihf-gcc-14 >/dev/null 2>&1; then
+              sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-14)" /usr/local/bin/arm-linux-gnueabihf-gcc
+            fi
+          fi
+
       - name: Enable package architectures for apt
         run: |
           set -e
@@ -692,6 +701,29 @@ jobs:
             ' "$log_file"
           }
 
+          resolve_compiler_bin() {
+            local cross_prefix="$1"
+            local cc_bin=""
+
+            if [ -n "$cross_prefix" ]; then
+              if command -v "${cross_prefix}gcc-12" >/dev/null 2>&1; then
+                cc_bin="${cross_prefix}gcc-12"
+              elif command -v "${cross_prefix}gcc" >/dev/null 2>&1; then
+                cc_bin="${cross_prefix}gcc"
+              elif command -v "${cross_prefix}gcc-14" >/dev/null 2>&1; then
+                cc_bin="${cross_prefix}gcc-14"
+              fi
+            else
+              if command -v gcc-12 >/dev/null 2>&1; then
+                cc_bin="gcc-12"
+              elif command -v gcc >/dev/null 2>&1; then
+                cc_bin="gcc"
+              fi
+            fi
+
+            printf '%s\n' "$cc_bin"
+          }
+
           experimental_defconfig_candidates() {
             local karch="$1"
             local inferred="$2"
@@ -975,6 +1007,7 @@ jobs:
                 DEFCONFIG_FAILURE_SNIPPET=""
                 DEFCONFIG_LOG="$RUNNER_TEMP/experimental-defconfig-${CHANNEL}-${KVER}.log"
                 MODULES_PREP_LOG="$RUNNER_TEMP/experimental-modules-prepare-${CHANNEL}-${KVER}.log"
+                EXP_CC_BIN="$(resolve_compiler_bin "$CROSS_COMPILE")"
 
                 while IFS= read -r DEFCONFIG_CANDIDATE; do
                   [ -z "$DEFCONFIG_CANDIDATE" ] && continue
@@ -987,7 +1020,7 @@ jobs:
 
                   echo "Applying experimental defconfig candidate '$DEFCONFIG_CANDIDATE' for $KVER ($CHANNEL)"
                   rm -f "$DEFCONFIG_LOG"
-                  if make -C "$SRC_DIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG_CANDIDATE" 2>&1 | tee "$DEFCONFIG_LOG"; then
+                  if make -C "$SRC_DIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" CC="$EXP_CC_BIN" "$DEFCONFIG_CANDIDATE" 2>&1 | tee "$DEFCONFIG_LOG"; then
                     APPLIED_DEFCONFIG="$DEFCONFIG_CANDIDATE"
                     break
                   fi
@@ -1016,7 +1049,7 @@ jobs:
                 fi
 
                 rm -f "$MODULES_PREP_LOG"
-                if ! make -C "$SRC_DIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" modules_prepare 2>&1 | tee "$MODULES_PREP_LOG"; then
+                if ! make -C "$SRC_DIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" CC="$EXP_CC_BIN" modules_prepare 2>&1 | tee "$MODULES_PREP_LOG"; then
                   MODULES_PREP_SNIPPET="$(extract_command_failure_snippet "$MODULES_PREP_LOG")"
                   if [ -n "$MODULES_PREP_SNIPPET" ]; then
                     MODULES_PREP_ANNOTATION="$(printf '%s' "$MODULES_PREP_SNIPPET" | escape_annotation)"
@@ -1031,11 +1064,7 @@ jobs:
                 touch "$PREP_STAMP"
               fi
 
-              if [ -n "$CROSS_COMPILE" ]; then
-                CC_BIN="${CROSS_COMPILE}gcc-12"
-              else
-                CC_BIN="gcc-12"
-              fi
+              CC_BIN="$(resolve_compiler_bin "$CROSS_COMPILE")"
               if ! command -v "$CC_BIN" >/dev/null 2>&1; then
                 echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): compiler not found ($CC_BIN)"
                 EXP_SKIPS=$((EXP_SKIPS + 1))
