@@ -706,18 +706,20 @@ jobs:
             local cc_bin=""
 
             if [ -n "$cross_prefix" ]; then
-              if command -v "${cross_prefix}gcc-12" >/dev/null 2>&1; then
-                cc_bin="${cross_prefix}gcc-12"
-              elif command -v "${cross_prefix}gcc" >/dev/null 2>&1; then
+              if command -v "${cross_prefix}gcc" >/dev/null 2>&1; then
                 cc_bin="${cross_prefix}gcc"
               elif command -v "${cross_prefix}gcc-14" >/dev/null 2>&1; then
                 cc_bin="${cross_prefix}gcc-14"
+              elif command -v "${cross_prefix}gcc-12" >/dev/null 2>&1; then
+                cc_bin="${cross_prefix}gcc-12"
               fi
             else
-              if command -v gcc-12 >/dev/null 2>&1; then
-                cc_bin="gcc-12"
-              elif command -v gcc >/dev/null 2>&1; then
+              if command -v gcc >/dev/null 2>&1; then
                 cc_bin="gcc"
+              elif command -v gcc-14 >/dev/null 2>&1; then
+                cc_bin="gcc-14"
+              elif command -v gcc-12 >/dev/null 2>&1; then
+                cc_bin="gcc-12"
               fi
             fi
 
