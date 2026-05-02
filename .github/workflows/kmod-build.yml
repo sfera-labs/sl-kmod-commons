@@ -23,6 +23,14 @@ on:
         required: false
         type: string
         default: 'rpi'
+      experimental_channels:
+        required: false
+        type: string
+        default: 'rpi-update-next,rpi-update-main'
+      experimental_blocking:
+        required: false
+        type: boolean
+        default: false
       module_path:
         required: false
         type: string
@@ -440,9 +448,107 @@ jobs:
           echo "family_policy_failed=$FAMILY_POLICY_FAILED" >> "$GITHUB_OUTPUT"
           echo "family_policy_reason=$FAMILY_POLICY_REASON" >> "$GITHUB_OUTPUT"
 
+      - name: Discover experimental channel targets
+        id: discover_experimental
+        run: |
+          set -euo pipefail
+
+          CHANNELS_RAW="${{ inputs.experimental_channels }}"
+          TARGET_FILE="$GITHUB_WORKSPACE/experimental_targets.txt"
+          : > "$TARGET_FILE"
+
+          NORMALIZED_CHANNELS="$(echo "$CHANNELS_RAW" | tr '[:upper:]' '[:lower:]' | tr ',' ' ')"
+          SEEN=" "
+          COUNT=0
+
+          map_channel_branch() {
+            case "$1" in
+              rpi-update-next)
+                echo "next"
+                ;;
+              rpi-update-main)
+                echo "master"
+                ;;
+              *)
+                echo ""
+                ;;
+            esac
+          }
+
+          discover_channel_targets() {
+            local channel="$1"
+            local fw_branch="$2"
+            local tree_json
+            local linux_hash
+            local kver_arm64
+            local kver_armhf
+
+            tree_json="$(curl -fsSL "https://api.github.com/repos/raspberrypi/firmware/git/trees/${fw_branch}?recursive=1" || true)"
+            if [ -z "$tree_json" ]; then
+              echo "::warning::Experimental channel '$channel' skipped: failed to query firmware tree"
+              return
+            fi
+
+            linux_hash="$(curl -fsSL "https://raw.githubusercontent.com/raspberrypi/firmware/${fw_branch}/extra/git_hash" 2>/dev/null | tr -d '[:space:]' || true)"
+            if ! echo "$linux_hash" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::warning::Experimental channel '$channel' skipped: invalid linux git hash metadata"
+              return
+            fi
+
+            kver_arm64="$(printf '%s\n' "$tree_json" | jq -r '.tree[].path' | sed -n 's#^modules/\([^/]*\)/.*#\1#p' | sort -uV | grep -E -- '-(2712|v8|v8-16k|v8-rt)\+$' | tail -n1 || true)"
+            kver_armhf="$(printf '%s\n' "$tree_json" | jq -r '.tree[].path' | sed -n 's#^modules/\([^/]*\)/.*#\1#p' | sort -uV | grep -E -- '-(v6|v7|v7l)\+$' | tail -n1 || true)"
+
+            if [ -n "$kver_arm64" ]; then
+              echo "$channel|$kver_arm64|arm64|arm64||$linux_hash|bcm2711_defconfig" >> "$TARGET_FILE"
+            fi
+            if [ -n "$kver_armhf" ]; then
+              echo "$channel|$kver_armhf|armhf|arm|arm-linux-gnueabihf-|$linux_hash|bcm2709_defconfig" >> "$TARGET_FILE"
+            fi
+
+            if [ -z "$kver_arm64" ] && [ -z "$kver_armhf" ]; then
+              echo "::warning::Experimental channel '$channel' skipped: no usable module target versions discovered"
+              return
+            fi
+
+            echo "Discovered experimental channel '$channel': arm64='${kver_arm64:-n/a}' armhf='${kver_armhf:-n/a}'"
+          }
+
+          for token in $NORMALIZED_CHANNELS; do
+            token="$(echo "$token" | xargs)"
+            [ -z "$token" ] && continue
+
+            case " $SEEN " in
+              *" $token "*)
+                continue
+                ;;
+            esac
+            SEEN="$SEEN$token "
+
+            fw_branch="$(map_channel_branch "$token")"
+            if [ -z "$fw_branch" ]; then
+              echo "::warning::Ignoring invalid experimental_channels token '$token'"
+              continue
+            fi
+
+            discover_channel_targets "$token" "$fw_branch"
+          done
+
+          if [ -s "$TARGET_FILE" ]; then
+            sort -u "$TARGET_FILE" -o "$TARGET_FILE"
+            COUNT="$(wc -l < "$TARGET_FILE" | tr -d ' ')"
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+            echo "target_count=$COUNT" >> "$GITHUB_OUTPUT"
+            echo "Experimental targets (channel|kver|apt_arch|arch|cross|linux_hash|defconfig):"
+            cat "$TARGET_FILE"
+          else
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+            echo "target_count=0" >> "$GITHUB_OUTPUT"
+            echo "No experimental channel targets discovered"
+          fi
+
       - name: Build against kernels
         id: build
-        if: steps.download_headers.outputs.skip != 'true'
+        if: steps.download_headers.outputs.skip != 'true' || steps.discover_experimental.outputs.has_targets == 'true'
         working-directory: ${{ inputs.module_path }}
         continue-on-error: true
         run: |
@@ -458,6 +564,14 @@ jobs:
           OK_KERNELS=""
           FAIL_KERNELS=""
           SKIP_KERNELS=""
+          EXP_BLOCKING="${{ inputs.experimental_blocking }}"
+          EXP_OKS=0
+          EXP_FAILS=0
+          EXP_SKIPS=0
+          EXP_TARGETS=0
+          EXP_OK_KERNELS=""
+          EXP_FAIL_KERNELS=""
+          EXP_SKIP_KERNELS=""
           ARTIFACT_ROOT="${RUNNER_TEMP}/kmod-artifacts"
 
           # Stage artifacts outside the module tree to avoid accidental cleanup by local make targets.
@@ -468,6 +582,7 @@ jobs:
           rm -rf root
           mkdir root
 
+          if [ -s "$GITHUB_WORKSPACE/kernel_targets.txt" ]; then
           while IFS='|' read -r KVER APT_ARCH HEADER_PKG FAMILY CORE LINE; do
             [ -z "$KVER" ] && continue
             TARGETS=$((TARGETS + 1))
@@ -692,6 +807,106 @@ jobs:
               find . -maxdepth 1 -type f -name '*.dtbo' -print -exec cp -v {} "$OUT/" \;
             fi
           done < "$GITHUB_WORKSPACE/kernel_targets.txt"
+          else
+            echo "No apt-derived kernel targets to build"
+          fi
+
+          if [ -s "$GITHUB_WORKSPACE/experimental_targets.txt" ]; then
+            mkdir -p "$RUNNER_TEMP/experimental-linux"
+            while IFS='|' read -r CHANNEL KVER APT_ARCH KARCH CROSS_COMPILE LINUX_HASH DEFCONFIG; do
+              [ -z "$KVER" ] && continue
+              EXP_TARGETS=$((EXP_TARGETS + 1))
+
+              SRC_DIR="$RUNNER_TEMP/experimental-linux/${CHANNEL}-${LINUX_HASH}"
+              if [ ! -d "$SRC_DIR/.git" ]; then
+                rm -rf "$SRC_DIR"
+                mkdir -p "$SRC_DIR"
+                git init "$SRC_DIR" >/dev/null 2>&1
+                git -C "$SRC_DIR" remote add origin https://github.com/raspberrypi/linux.git
+                if ! git -C "$SRC_DIR" fetch --depth 1 origin "$LINUX_HASH" >/dev/null 2>&1; then
+                  echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): failed to fetch linux source $LINUX_HASH"
+                  EXP_SKIPS=$((EXP_SKIPS + 1))
+                  EXP_SKIP_KERNELS="${EXP_SKIP_KERNELS:+$EXP_SKIP_KERNELS,}$CHANNEL:$KVER"
+                  continue
+                fi
+                git -C "$SRC_DIR" checkout -q FETCH_HEAD
+              fi
+
+              PREP_STAMP="$SRC_DIR/.prepared-${KARCH}-${DEFCONFIG}"
+              if [ ! -f "$PREP_STAMP" ]; then
+                if ! make -C "$SRC_DIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG" >/dev/null 2>&1; then
+                  echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): failed to apply defconfig '$DEFCONFIG'"
+                  EXP_SKIPS=$((EXP_SKIPS + 1))
+                  EXP_SKIP_KERNELS="${EXP_SKIP_KERNELS:+$EXP_SKIP_KERNELS,}$CHANNEL:$KVER"
+                  continue
+                fi
+                if ! make -C "$SRC_DIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" modules_prepare >/dev/null 2>&1; then
+                  echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): modules_prepare failed"
+                  EXP_SKIPS=$((EXP_SKIPS + 1))
+                  EXP_SKIP_KERNELS="${EXP_SKIP_KERNELS:+$EXP_SKIP_KERNELS,}$CHANNEL:$KVER"
+                  continue
+                fi
+                touch "$PREP_STAMP"
+              fi
+
+              if [ -n "$CROSS_COMPILE" ]; then
+                CC_BIN="${CROSS_COMPILE}gcc-12"
+              else
+                CC_BIN="gcc-12"
+              fi
+              if ! command -v "$CC_BIN" >/dev/null 2>&1; then
+                echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): compiler not found ($CC_BIN)"
+                EXP_SKIPS=$((EXP_SKIPS + 1))
+                EXP_SKIP_KERNELS="${EXP_SKIP_KERNELS:+$EXP_SKIP_KERNELS,}$CHANNEL:$KVER"
+                continue
+              fi
+
+              sudo mkdir -p "/lib/modules/$KVER"
+              sudo rm -rf "/lib/modules/$KVER/build"
+              sudo ln -s "$SRC_DIR" "/lib/modules/$KVER/build"
+
+              export ARCH="$KARCH"
+              export CROSS_COMPILE="$CROSS_COMPILE"
+              export CC="$CC_BIN"
+              export KVER="$KVER"
+
+              KO_COUNT=0
+              DTBO_COUNT=0
+              make clean || true
+              if make; then
+                KO_COUNT="$(find . -maxdepth 1 -type f -name '*.ko' | wc -l | tr -d ' ')"
+                DTBO_COUNT="$(find . -maxdepth 1 -type f -name '*.dtbo' | wc -l | tr -d ' ')"
+                if [ "$KO_COUNT" -eq 0 ] || [ "$DTBO_COUNT" -eq 0 ]; then
+                  echo "::error::Kernel $KVER ($CHANNEL) failed: expected .ko and .dtbo outputs are required"
+                  EXP_FAILS=$((EXP_FAILS + 1))
+                  EXP_FAIL_KERNELS="${EXP_FAIL_KERNELS:+$EXP_FAIL_KERNELS,}$CHANNEL:$KVER"
+                  if [ "$EXP_BLOCKING" = "true" ]; then
+                    FAIL=1
+                  fi
+                else
+                  echo "::notice::Kernel $KVER ($CHANNEL) succeeded"
+                  EXP_OKS=$((EXP_OKS + 1))
+                  EXP_OK_KERNELS="${EXP_OK_KERNELS:+$EXP_OK_KERNELS,}$CHANNEL:$KVER"
+                fi
+              else
+                echo "::error::Kernel $KVER ($CHANNEL) failed: make returned non-zero"
+                EXP_FAILS=$((EXP_FAILS + 1))
+                EXP_FAIL_KERNELS="${EXP_FAIL_KERNELS:+$EXP_FAIL_KERNELS,}$CHANNEL:$KVER"
+                if [ "$EXP_BLOCKING" = "true" ]; then
+                  FAIL=1
+                fi
+              fi
+
+              if [ "$KO_COUNT" -gt 0 ] && [ "$DTBO_COUNT" -gt 0 ]; then
+                OUT="$ARTIFACT_ROOT/experimental/$CHANNEL/$APT_ARCH/module-artifacts-$KVER"
+                mkdir -p "$OUT"
+                find . -maxdepth 1 -type f -name '*.ko' -print -exec cp -v {} "$OUT/" \;
+                find . -maxdepth 1 -type f -name '*.dtbo' -print -exec cp -v {} "$OUT/" \;
+              fi
+            done < "$GITHUB_WORKSPACE/experimental_targets.txt"
+          else
+            echo "No experimental channel targets to build"
+          fi
 
           echo "== Staged artifact files =="
           find "$ARTIFACT_ROOT" -type f | sort || true
@@ -699,18 +914,26 @@ jobs:
           [ -z "$STAGED_ARTIFACT_COUNT" ] && STAGED_ARTIFACT_COUNT=0
           echo "Staged artifact file count: $STAGED_ARTIFACT_COUNT"
 
-          echo "Total builds: $((OKS+FAILS+SKIPS)), OK: $OKS, SKIP: $SKIPS, FAIL: $FAILS"
-          echo "target_count=$TARGETS" >> "$GITHUB_OUTPUT"
+          echo "Stable builds: total=$((OKS+FAILS+SKIPS)) ok=$OKS skip=$SKIPS fail=$FAILS"
+          echo "Experimental builds: total=$((EXP_OKS+EXP_FAILS+EXP_SKIPS)) ok=$EXP_OKS skip=$EXP_SKIPS fail=$EXP_FAILS"
+          echo "target_count=$((TARGETS + EXP_TARGETS))" >> "$GITHUB_OUTPUT"
           echo "ok_count=$OKS" >> "$GITHUB_OUTPUT"
           echo "skip_count=$SKIPS" >> "$GITHUB_OUTPUT"
           echo "fail_count=$FAILS" >> "$GITHUB_OUTPUT"
           echo "ok_kernels=$OK_KERNELS" >> "$GITHUB_OUTPUT"
           echo "fail_kernels=$FAIL_KERNELS" >> "$GITHUB_OUTPUT"
           echo "skip_kernels=$SKIP_KERNELS" >> "$GITHUB_OUTPUT"
+          echo "exp_target_count=$EXP_TARGETS" >> "$GITHUB_OUTPUT"
+          echo "exp_ok_count=$EXP_OKS" >> "$GITHUB_OUTPUT"
+          echo "exp_skip_count=$EXP_SKIPS" >> "$GITHUB_OUTPUT"
+          echo "exp_fail_count=$EXP_FAILS" >> "$GITHUB_OUTPUT"
+          echo "exp_ok_kernels=$EXP_OK_KERNELS" >> "$GITHUB_OUTPUT"
+          echo "exp_fail_kernels=$EXP_FAIL_KERNELS" >> "$GITHUB_OUTPUT"
+          echo "exp_skip_kernels=$EXP_SKIP_KERNELS" >> "$GITHUB_OUTPUT"
           exit $FAIL
 
       - name: Upload artifacts
-        if: always() && steps.download_headers.outputs.skip != 'true'
+        if: always() && steps.build.outcome != 'skipped'
         uses: actions/upload-artifact@v6
         with:
           name: kmod-artifacts
@@ -731,13 +954,20 @@ jobs:
             exit 0
           fi
 
-          if [ "${{ steps.download_headers.outputs.skip }}" = "true" ]; then
+          HAS_EXPERIMENTAL="${{ steps.discover_experimental.outputs.has_targets }}"
+          EXP_BLOCKING="${{ inputs.experimental_blocking }}"
+
+          if [ "${{ steps.download_headers.outputs.skip }}" = "true" ] && [ "$HAS_EXPERIMENTAL" != "true" ]; then
             if [ "${{ steps.download_headers.outputs.family_policy_failed }}" = "true" ]; then
               echo "::error::FAIL: family policy violation (required families missing): ${{ steps.download_headers.outputs.family_policy_reason }} selected[rpi=${{ steps.download_headers.outputs.selected_rpi_count }},ubuntu=${{ steps.download_headers.outputs.selected_ubuntu_count }}] build_targets[rpi=${{ steps.download_headers.outputs.build_target_rpi_count }},ubuntu=${{ steps.download_headers.outputs.build_target_ubuntu_count }}]"
               exit 1
             fi
             echo "::warning::SKIP: ${{ steps.download_headers.outputs.skip_reason }}"
             exit 0
+          fi
+
+          if [ "${{ steps.download_headers.outputs.skip }}" = "true" ] && [ "$HAS_EXPERIMENTAL" = "true" ]; then
+            echo "::notice::APT targets unavailable; proceeding with experimental channel targets"
           fi
 
           if [ "${{ steps.download_headers.outputs.family_policy_failed }}" = "true" ]; then
@@ -749,28 +979,45 @@ jobs:
           OKS="${{ steps.build.outputs.ok_count }}"
           SKIPS="${{ steps.build.outputs.skip_count }}"
           FAILS="${{ steps.build.outputs.fail_count }}"
-          OK_KERNELS="${{ steps.build.outputs.ok_kernels }}"
-          FAIL_KERNELS="${{ steps.build.outputs.fail_kernels }}"
           SKIP_KERNELS="${{ steps.build.outputs.skip_kernels }}"
+          EXP_TARGETS="${{ steps.build.outputs.exp_target_count }}"
+          EXP_OKS="${{ steps.build.outputs.exp_ok_count }}"
+          EXP_SKIPS="${{ steps.build.outputs.exp_skip_count }}"
+          EXP_FAILS="${{ steps.build.outputs.exp_fail_count }}"
+          EXP_SKIP_KERNELS="${{ steps.build.outputs.exp_skip_kernels }}"
           [ -z "$TARGETS" ] && TARGETS=0
           [ -z "$OKS" ] && OKS=0
           [ -z "$SKIPS" ] && SKIPS=0
           [ -z "$FAILS" ] && FAILS=0
+          [ -z "$EXP_TARGETS" ] && EXP_TARGETS=0
+          [ -z "$EXP_OKS" ] && EXP_OKS=0
+          [ -z "$EXP_SKIPS" ] && EXP_SKIPS=0
+          [ -z "$EXP_FAILS" ] && EXP_FAILS=0
 
           if [ -n "$SKIP_KERNELS" ]; then
             echo "::warning::Skipped kernels: $SKIP_KERNELS"
           fi
+          if [ -n "$EXP_SKIP_KERNELS" ]; then
+            echo "::warning::Skipped experimental kernels: $EXP_SKIP_KERNELS"
+          fi
+
+          echo "::notice::Stable summary: targets=$((OKS+SKIPS+FAILS)) ok=$OKS skip=$SKIPS fail=$FAILS"
+          echo "::notice::Experimental summary: channels='${{ inputs.experimental_channels }}' targets=$EXP_TARGETS ok=$EXP_OKS skip=$EXP_SKIPS fail=$EXP_FAILS blocking=$EXP_BLOCKING"
 
           if [ "$FAILS" -gt 0 ]; then
-            echo "::error::FAIL: targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS"
+            echo "::error::FAIL: stable targets failed (targets=$((OKS+SKIPS+FAILS)) ok=$OKS skip=$SKIPS fail=$FAILS)"
+          elif [ "$EXP_FAILS" -gt 0 ] && [ "$EXP_BLOCKING" = "true" ]; then
+            echo "::error::FAIL: experimental targets failed and blocking is enabled (targets=$EXP_TARGETS ok=$EXP_OKS skip=$EXP_SKIPS fail=$EXP_FAILS)"
+          elif [ "$EXP_FAILS" -gt 0 ]; then
+            echo "::warning::WARN: experimental targets failed but are non-blocking (targets=$EXP_TARGETS ok=$EXP_OKS skip=$EXP_SKIPS fail=$EXP_FAILS)"
           elif [ "$OKS" -gt 0 ]; then
-            echo "::notice::OK: targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS artifacts=.ko+.dtbo"
+            echo "::notice::OK: targets=$TARGETS stable_ok=$OKS stable_skip=$SKIPS stable_fail=$FAILS exp_ok=$EXP_OKS exp_skip=$EXP_SKIPS exp_fail=$EXP_FAILS artifacts=.ko+.dtbo"
           else
-            echo "::warning::WARN: targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS"
+            echo "::warning::WARN: targets=$TARGETS stable_ok=$OKS stable_skip=$SKIPS stable_fail=$FAILS exp_ok=$EXP_OKS exp_skip=$EXP_SKIPS exp_fail=$EXP_FAILS"
           fi
 
       - name: Fail with context
-        if: steps.download_headers.outputs.skip != 'true' && steps.build.outcome == 'failure'
+        if: steps.build.outcome == 'failure'
         run: |
           echo "::error::One or more kernel target builds failed"
           exit 1
