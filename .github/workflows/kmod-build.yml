@@ -660,6 +660,55 @@ jobs:
             ' "$log_file"
           }
 
+          extract_command_failure_snippet() {
+            local log_file="$1"
+            awk '
+              { lines[NR]=$0 }
+              /(error:|undefined reference|No rule to make target|No such file or directory|failed|ERROR)/ && first == 0 { first=NR }
+              END {
+                if (NR == 0) {
+                  exit
+                }
+                if (first > 0) {
+                  start=first-2
+                  if (start < 1) {
+                    start=1
+                  }
+                  end=first+6
+                  if (end > NR) {
+                    end=NR
+                  }
+                } else {
+                  start=NR-19
+                  if (start < 1) {
+                    start=1
+                  }
+                  end=NR
+                }
+                for (i=start; i<=end; i++) {
+                  print lines[i]
+                }
+              }
+            ' "$log_file"
+          }
+
+          experimental_defconfig_candidates() {
+            local karch="$1"
+            local inferred="$2"
+
+            case "$karch" in
+              arm)
+                printf '%s\n' "$inferred" bcm2709_defconfig bcmrpi_defconfig multi_v7_defconfig
+                ;;
+              arm64)
+                printf '%s\n' "$inferred" bcm2711_defconfig bcm2712_defconfig defconfig
+                ;;
+              *)
+                printf '%s\n' "$inferred"
+                ;;
+            esac | awk 'NF > 0 && !seen[$0]++'
+          }
+
           # Stage artifacts outside the module tree to avoid accidental cleanup by local make targets.
           rm -rf "$ARTIFACT_ROOT"
           mkdir -p "$ARTIFACT_ROOT"
@@ -907,9 +956,9 @@ jobs:
               if [ ! -d "$SRC_DIR/.git" ]; then
                 rm -rf "$SRC_DIR"
                 mkdir -p "$SRC_DIR"
-                git init "$SRC_DIR" >/dev/null 2>&1
+                git init "$SRC_DIR"
                 git -C "$SRC_DIR" remote add origin https://github.com/raspberrypi/linux.git
-                if ! git -C "$SRC_DIR" fetch --depth 1 origin "$LINUX_HASH" >/dev/null 2>&1; then
+                if ! git -C "$SRC_DIR" fetch --depth 1 origin "$LINUX_HASH"; then
                   echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): failed to fetch linux source $LINUX_HASH"
                   EXP_SKIPS=$((EXP_SKIPS + 1))
                   EXP_SKIP_KERNELS="${EXP_SKIP_KERNELS:+$EXP_SKIP_KERNELS,}$CHANNEL:$KVER"
@@ -920,22 +969,61 @@ jobs:
 
               PREP_STAMP="$SRC_DIR/.prepared-${KARCH}-${DEFCONFIG}"
               if [ ! -f "$PREP_STAMP" ]; then
-                DEFCONFIG_PATH="$SRC_DIR/arch/$KARCH/configs/$DEFCONFIG"
-                if [ ! -f "$DEFCONFIG_PATH" ]; then
-                  echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): expected inferred defconfig '$DEFCONFIG' for flavor '$KVER' not found"
+                DEFCONFIG_TRIED=""
+                DEFCONFIG_MISSING=""
+                APPLIED_DEFCONFIG=""
+                DEFCONFIG_FAILURE_SNIPPET=""
+                DEFCONFIG_LOG="$RUNNER_TEMP/experimental-defconfig-${CHANNEL}-${KVER}.log"
+                MODULES_PREP_LOG="$RUNNER_TEMP/experimental-modules-prepare-${CHANNEL}-${KVER}.log"
+
+                while IFS= read -r DEFCONFIG_CANDIDATE; do
+                  [ -z "$DEFCONFIG_CANDIDATE" ] && continue
+                  DEFCONFIG_TRIED="${DEFCONFIG_TRIED:+$DEFCONFIG_TRIED,}$DEFCONFIG_CANDIDATE"
+                  DEFCONFIG_PATH="$SRC_DIR/arch/$KARCH/configs/$DEFCONFIG_CANDIDATE"
+                  if [ ! -f "$DEFCONFIG_PATH" ]; then
+                    DEFCONFIG_MISSING="${DEFCONFIG_MISSING:+$DEFCONFIG_MISSING,}$DEFCONFIG_CANDIDATE"
+                    continue
+                  fi
+
+                  echo "Applying experimental defconfig candidate '$DEFCONFIG_CANDIDATE' for $KVER ($CHANNEL)"
+                  rm -f "$DEFCONFIG_LOG"
+                  if make -C "$SRC_DIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG_CANDIDATE" 2>&1 | tee "$DEFCONFIG_LOG"; then
+                    APPLIED_DEFCONFIG="$DEFCONFIG_CANDIDATE"
+                    break
+                  fi
+
+                  DEFCONFIG_FAILURE_SNIPPET="$(extract_command_failure_snippet "$DEFCONFIG_LOG")"
+                done <<< "$(experimental_defconfig_candidates "$KARCH" "$DEFCONFIG")"
+
+                if [ -z "$APPLIED_DEFCONFIG" ]; then
+                  if [ -n "$DEFCONFIG_MISSING" ]; then
+                    echo "::warning::Experimental kernel $KVER ($CHANNEL): missing defconfig file(s) among attempted candidates: $DEFCONFIG_MISSING"
+                  fi
+
+                  if [ -n "$DEFCONFIG_FAILURE_SNIPPET" ]; then
+                    DEFCONFIG_ERR_ANNOTATION="$(printf '%s' "$DEFCONFIG_FAILURE_SNIPPET" | escape_annotation)"
+                    echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): failed to apply inferred defconfig '$DEFCONFIG' (attempted: $DEFCONFIG_TRIED); reason:%0A$DEFCONFIG_ERR_ANNOTATION"
+                  else
+                    echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): failed to apply inferred defconfig '$DEFCONFIG' (attempted: $DEFCONFIG_TRIED)"
+                  fi
                   EXP_SKIPS=$((EXP_SKIPS + 1))
                   EXP_SKIP_KERNELS="${EXP_SKIP_KERNELS:+$EXP_SKIP_KERNELS,}$CHANNEL:$KVER"
                   continue
                 fi
 
-                if ! make -C "$SRC_DIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG" >/dev/null 2>&1; then
-                  echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): failed to apply inferred defconfig '$DEFCONFIG'"
-                  EXP_SKIPS=$((EXP_SKIPS + 1))
-                  EXP_SKIP_KERNELS="${EXP_SKIP_KERNELS:+$EXP_SKIP_KERNELS,}$CHANNEL:$KVER"
-                  continue
+                if [ "$APPLIED_DEFCONFIG" != "$DEFCONFIG" ]; then
+                  echo "::warning::Experimental kernel $KVER ($CHANNEL): inferred defconfig '$DEFCONFIG' failed; fallback '$APPLIED_DEFCONFIG' applied"
                 fi
-                if ! make -C "$SRC_DIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" modules_prepare >/dev/null 2>&1; then
-                  echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): modules_prepare failed"
+
+                rm -f "$MODULES_PREP_LOG"
+                if ! make -C "$SRC_DIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" modules_prepare 2>&1 | tee "$MODULES_PREP_LOG"; then
+                  MODULES_PREP_SNIPPET="$(extract_command_failure_snippet "$MODULES_PREP_LOG")"
+                  if [ -n "$MODULES_PREP_SNIPPET" ]; then
+                    MODULES_PREP_ANNOTATION="$(printf '%s' "$MODULES_PREP_SNIPPET" | escape_annotation)"
+                    echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): modules_prepare failed after '$APPLIED_DEFCONFIG'; reason:%0A$MODULES_PREP_ANNOTATION"
+                  else
+                    echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): modules_prepare failed after '$APPLIED_DEFCONFIG'"
+                  fi
                   EXP_SKIPS=$((EXP_SKIPS + 1))
                   EXP_SKIP_KERNELS="${EXP_SKIP_KERNELS:+$EXP_SKIP_KERNELS,}$CHANNEL:$KVER"
                   continue
