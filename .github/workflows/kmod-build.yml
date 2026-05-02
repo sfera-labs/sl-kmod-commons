@@ -480,8 +480,51 @@ jobs:
             local fw_branch="$2"
             local tree_json
             local linux_hash
-            local kver_arm64
-            local kver_armhf
+            local all_kvers
+            local newest_core
+
+            infer_experimental_target() {
+              local kver="$1"
+              local apt_arch=""
+              local karch=""
+              local cross=""
+              local defconfig=""
+
+              case "$kver" in
+                *-v6+)
+                  apt_arch="armhf"
+                  karch="arm"
+                  cross="arm-linux-gnueabihf-"
+                  defconfig="bcmrpi_defconfig"
+                  ;;
+                *-v7+|*-v7l+)
+                  apt_arch="armhf"
+                  karch="arm"
+                  cross="arm-linux-gnueabihf-"
+                  defconfig="bcm2709_defconfig"
+                  ;;
+                *-2712+)
+                  apt_arch="arm64"
+                  karch="arm64"
+                  cross=""
+                  defconfig="bcm2712_defconfig"
+                  ;;
+                *-v8+|*-v8-rt+|*-v8-16k+)
+                  apt_arch="arm64"
+                  karch="arm64"
+                  cross=""
+                  defconfig="bcm2711_defconfig"
+                  ;;
+                *)
+                  ;;
+              esac
+
+              if [ -z "$apt_arch" ] || [ -z "$karch" ] || [ -z "$defconfig" ]; then
+                return 1
+              fi
+
+              echo "$apt_arch|$karch|$cross|$defconfig"
+            }
 
             tree_json="$(curl -fsSL "https://api.github.com/repos/raspberrypi/firmware/git/trees/${fw_branch}?recursive=1" || true)"
             if [ -z "$tree_json" ]; then
@@ -495,22 +538,37 @@ jobs:
               return
             fi
 
-            kver_arm64="$(printf '%s\n' "$tree_json" | jq -r '.tree[].path' | sed -n 's#^modules/\([^/]*\)/.*#\1#p' | sort -uV | grep -E -- '-(2712|v8|v8-16k|v8-rt)\+$' | tail -n1 || true)"
-            kver_armhf="$(printf '%s\n' "$tree_json" | jq -r '.tree[].path' | sed -n 's#^modules/\([^/]*\)/.*#\1#p' | sort -uV | grep -E -- '-(v6|v7|v7l)\+$' | tail -n1 || true)"
+            all_kvers="$(printf '%s\n' "$tree_json" | jq -r '.tree[].path' | sed -n 's#^modules/\([^/]*\)/.*#\1#p' | sort -uV)"
+            newest_core="$(printf '%s\n' "$all_kvers" | sed -n 's#^\([0-9]\+\.[0-9]\+\.[0-9]\+\).*$#\1#p' | sort -uV | tail -n1 || true)"
 
-            if [ -n "$kver_arm64" ]; then
-              echo "$channel|$kver_arm64|arm64|arm64||$linux_hash|bcm2711_defconfig" >> "$TARGET_FILE"
-            fi
-            if [ -n "$kver_armhf" ]; then
-              echo "$channel|$kver_armhf|armhf|arm|arm-linux-gnueabihf-|$linux_hash|bcm2709_defconfig" >> "$TARGET_FILE"
-            fi
-
-            if [ -z "$kver_arm64" ] && [ -z "$kver_armhf" ]; then
+            if [ -z "$newest_core" ]; then
               echo "::warning::Experimental channel '$channel' skipped: no usable module target versions discovered"
               return
             fi
 
-            echo "Discovered experimental channel '$channel': arm64='${kver_arm64:-n/a}' armhf='${kver_armhf:-n/a}'"
+            ADDED=0
+            while IFS= read -r kver; do
+              [ -z "$kver" ] && continue
+              case "$kver" in
+                "$newest_core"*)
+                  TARGET_META="$(infer_experimental_target "$kver" || true)"
+                  if [ -z "$TARGET_META" ]; then
+                    echo "::warning::Experimental channel '$channel': skipping unsupported kernel flavor '$kver'"
+                    continue
+                  fi
+                  IFS='|' read -r APT_ARCH KARCH CROSS_COMPILE DEFCONFIG <<< "$TARGET_META"
+                  echo "$channel|$kver|$APT_ARCH|$KARCH|$CROSS_COMPILE|$linux_hash|$DEFCONFIG" >> "$TARGET_FILE"
+                  ADDED=$((ADDED + 1))
+                  ;;
+              esac
+            done <<< "$all_kvers"
+
+            if [ "$ADDED" -eq 0 ]; then
+              echo "::warning::Experimental channel '$channel' skipped: no mappable flavors for newest core '$newest_core'"
+              return
+            fi
+
+            echo "Discovered experimental channel '$channel': newest_core='$newest_core' flavors=$ADDED"
           }
 
           for token in $NORMALIZED_CHANNELS; do
@@ -573,6 +631,34 @@ jobs:
           EXP_FAIL_KERNELS=""
           EXP_SKIP_KERNELS=""
           ARTIFACT_ROOT="${RUNNER_TEMP}/kmod-artifacts"
+
+          escape_annotation() {
+            sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':a;N;$!ba;s/\n/%0A/g'
+          }
+
+          extract_make_error_snippet() {
+            local log_file="$1"
+            awk '
+              { lines[NR]=$0 }
+              /: error: / && first == 0 { first=NR }
+              END {
+                if (first == 0) {
+                  exit
+                }
+                start=first
+                for (i=first-1; i>=1 && i>=first-3; i--) {
+                  if (lines[i] ~ /: In function /) {
+                    start=i
+                    break
+                  }
+                }
+                end=first+4
+                for (i=start; i<=end && i<=NR; i++) {
+                  print lines[i]
+                }
+              }
+            ' "$log_file"
+          }
 
           # Stage artifacts outside the module tree to avoid accidental cleanup by local make targets.
           rm -rf "$ARTIFACT_ROOT"
@@ -834,8 +920,16 @@ jobs:
 
               PREP_STAMP="$SRC_DIR/.prepared-${KARCH}-${DEFCONFIG}"
               if [ ! -f "$PREP_STAMP" ]; then
+                DEFCONFIG_PATH="$SRC_DIR/arch/$KARCH/configs/$DEFCONFIG"
+                if [ ! -f "$DEFCONFIG_PATH" ]; then
+                  echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): expected inferred defconfig '$DEFCONFIG' for flavor '$KVER' not found"
+                  EXP_SKIPS=$((EXP_SKIPS + 1))
+                  EXP_SKIP_KERNELS="${EXP_SKIP_KERNELS:+$EXP_SKIP_KERNELS,}$CHANNEL:$KVER"
+                  continue
+                fi
+
                 if ! make -C "$SRC_DIR" ARCH="$KARCH" CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG" >/dev/null 2>&1; then
-                  echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): failed to apply defconfig '$DEFCONFIG'"
+                  echo "::warning::Skipping experimental kernel $KVER ($CHANNEL): failed to apply inferred defconfig '$DEFCONFIG'"
                   EXP_SKIPS=$((EXP_SKIPS + 1))
                   EXP_SKIP_KERNELS="${EXP_SKIP_KERNELS:+$EXP_SKIP_KERNELS,}$CHANNEL:$KVER"
                   continue
@@ -873,7 +967,9 @@ jobs:
               KO_COUNT=0
               DTBO_COUNT=0
               make clean || true
-              if make; then
+              MAKE_LOG="$RUNNER_TEMP/experimental-make-${CHANNEL}-${KVER}.log"
+              rm -f "$MAKE_LOG"
+              if make 2>&1 | tee "$MAKE_LOG"; then
                 KO_COUNT="$(find . -maxdepth 1 -type f -name '*.ko' | wc -l | tr -d ' ')"
                 DTBO_COUNT="$(find . -maxdepth 1 -type f -name '*.dtbo' | wc -l | tr -d ' ')"
                 if [ "$KO_COUNT" -eq 0 ] || [ "$DTBO_COUNT" -eq 0 ]; then
@@ -889,7 +985,13 @@ jobs:
                   EXP_OK_KERNELS="${EXP_OK_KERNELS:+$EXP_OK_KERNELS,}$CHANNEL:$KVER"
                 fi
               else
-                echo "::error::Kernel $KVER ($CHANNEL) failed: make returned non-zero"
+                ERR_SNIPPET="$(extract_make_error_snippet "$MAKE_LOG")"
+                if [ -n "$ERR_SNIPPET" ]; then
+                  ERR_ANNOTATION="$(printf '%s' "$ERR_SNIPPET" | escape_annotation)"
+                  echo "::error::Kernel $KVER ($CHANNEL) failed: make returned non-zero; relevant error:%0A$ERR_ANNOTATION"
+                else
+                  echo "::error::Kernel $KVER ($CHANNEL) failed: make returned non-zero"
+                fi
                 EXP_FAILS=$((EXP_FAILS + 1))
                 EXP_FAIL_KERNELS="${EXP_FAIL_KERNELS:+$EXP_FAIL_KERNELS,}$CHANNEL:$KVER"
                 if [ "$EXP_BLOCKING" = "true" ]; then
@@ -996,9 +1098,6 @@ jobs:
 
           if [ -n "$SKIP_KERNELS" ]; then
             echo "::warning::Skipped kernels: $SKIP_KERNELS"
-          fi
-          if [ -n "$EXP_SKIP_KERNELS" ]; then
-            echo "::warning::Skipped experimental kernels: $EXP_SKIP_KERNELS"
           fi
 
           echo "::notice::Stable summary: targets=$((OKS+SKIPS+FAILS)) ok=$OKS skip=$SKIPS fail=$FAILS"
