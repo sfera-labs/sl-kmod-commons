@@ -49,8 +49,8 @@ jobs:
           set -e
           echo "Runner host architecture: $(dpkg --print-architecture)"
           sudo apt update
-          # Base tools and native compiler
-          sudo apt install -y build-essential jq curl xz-utils gnupg gcc-12 device-tree-compiler
+          # Base tools and native compilers
+          sudo apt install -y build-essential jq curl xz-utils gnupg gcc-12 gcc-14 device-tree-compiler
           # Keep armhf cross toolchain available for targets inferred as 32-bit ARM.
           sudo apt install -y gcc-12-arm-linux-gnueabihf
           # Some RPi armhf header trees invoke gcc-14 explicitly.
@@ -714,10 +714,10 @@ jobs:
                 cc_bin="${cross_prefix}gcc-12"
               fi
             else
-              if command -v gcc >/dev/null 2>&1; then
-                cc_bin="gcc"
-              elif command -v gcc-14 >/dev/null 2>&1; then
+              if command -v gcc-14 >/dev/null 2>&1; then
                 cc_bin="gcc-14"
+              elif command -v gcc >/dev/null 2>&1; then
+                cc_bin="gcc"
               elif command -v gcc-12 >/dev/null 2>&1; then
                 cc_bin="gcc-12"
               fi
