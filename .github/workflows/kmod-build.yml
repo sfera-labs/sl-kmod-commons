@@ -58,10 +58,10 @@ jobs:
 
           # Some kernel Kconfig checks expect an unversioned cross-compiler name.
           if ! command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
-            if command -v arm-linux-gnueabihf-gcc-12 >/dev/null 2>&1; then
-              sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-12)" /usr/local/bin/arm-linux-gnueabihf-gcc
-            elif command -v arm-linux-gnueabihf-gcc-14 >/dev/null 2>&1; then
+            if command -v arm-linux-gnueabihf-gcc-14 >/dev/null 2>&1; then
               sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-14)" /usr/local/bin/arm-linux-gnueabihf-gcc
+            elif command -v arm-linux-gnueabihf-gcc-12 >/dev/null 2>&1; then
+              sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-12)" /usr/local/bin/arm-linux-gnueabihf-gcc
             fi
           fi
 
@@ -333,12 +333,16 @@ jobs:
           echo "Selected families: rpi=$RPI_SELECTED_COUNT ubuntu=$UBUNTU_SELECTED_COUNT"
 
           : > kernel_targets.txt
+          PRECHECK_SKIPS=0
+          PRECHECK_SKIP_KERNELS=""
 
           while IFS='|' read -r KVER APT_ARCH HEADER_PKG FAMILY CORE LINE; do
             [ -z "$KVER" ] && continue
 
             if ! apt download "$HEADER_PKG:$APT_ARCH" >/dev/null 2>&1; then
               echo "::warning::Skipping kernel '$KVER': cannot download headers package '$HEADER_PKG:$APT_ARCH'"
+              PRECHECK_SKIPS=$((PRECHECK_SKIPS + 1))
+              PRECHECK_SKIP_KERNELS="${PRECHECK_SKIP_KERNELS:+$PRECHECK_SKIP_KERNELS,}$KVER(precheck-missing-headers-package)"
               continue
             fi
 
@@ -346,6 +350,8 @@ jobs:
               BASE_RPT=$(echo "$KVER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt' || true)
               if [ -z "$BASE_RPT" ]; then
                 echo "::warning::Skipping kernel '$KVER': failed to derive +rpt base version"
+                PRECHECK_SKIPS=$((PRECHECK_SKIPS + 1))
+                PRECHECK_SKIP_KERNELS="${PRECHECK_SKIP_KERNELS:+$PRECHECK_SKIP_KERNELS,}$KVER(precheck-derive-rpt-base-failed)"
                 continue
               fi
 
@@ -353,6 +359,8 @@ jobs:
               if ! apt download "$COMMON_PKG:$APT_ARCH" >/dev/null 2>&1; then
                 if ! apt download "$COMMON_PKG" >/dev/null 2>&1; then
                   echo "::warning::Skipping kernel '$KVER': missing common headers package '$COMMON_PKG'"
+                  PRECHECK_SKIPS=$((PRECHECK_SKIPS + 1))
+                  PRECHECK_SKIP_KERNELS="${PRECHECK_SKIP_KERNELS:+$PRECHECK_SKIP_KERNELS,}$KVER(precheck-missing-common-headers)"
                   continue
                 fi
               fi
@@ -375,6 +383,8 @@ jobs:
               fi
               if [ "$KBUILD_OK" -ne 1 ]; then
                 echo "::warning::Skipping kernel '$KVER': missing host kbuild package '$KBUILD_PKG'"
+                PRECHECK_SKIPS=$((PRECHECK_SKIPS + 1))
+                PRECHECK_SKIP_KERNELS="${PRECHECK_SKIP_KERNELS:+$PRECHECK_SKIP_KERNELS,}$KVER(precheck-missing-kbuild-package)"
                 continue
               fi
             else
@@ -397,12 +407,16 @@ jobs:
               fi
               if [ "$KBUILD_OK" -ne 1 ]; then
                 echo "::warning::Skipping kernel '$KVER': host kbuild package '$KBUILD_PKG' not found"
+                PRECHECK_SKIPS=$((PRECHECK_SKIPS + 1))
+                PRECHECK_SKIP_KERNELS="${PRECHECK_SKIP_KERNELS:+$PRECHECK_SKIP_KERNELS,}$KVER(precheck-kbuild-not-found)"
                 continue
               fi
             fi
 
             if ! echo "$KVER|$APT_ARCH|$HEADER_PKG|$FAMILY|$CORE|$LINE" >> kernel_targets.txt; then
               echo "::warning::Skipping kernel '$KVER': failed to add target record"
+              PRECHECK_SKIPS=$((PRECHECK_SKIPS + 1))
+              PRECHECK_SKIP_KERNELS="${PRECHECK_SKIP_KERNELS:+$PRECHECK_SKIP_KERNELS,}$KVER(precheck-target-record-failed)"
               continue
             fi
           done < selected_targets.txt
@@ -438,6 +452,8 @@ jobs:
             echo "build_target_ubuntu_count=$UBUNTU_BUILD_TARGET_COUNT" >> "$GITHUB_OUTPUT"
             echo "family_policy_failed=$FAMILY_POLICY_FAILED" >> "$GITHUB_OUTPUT"
             echo "family_policy_reason=$FAMILY_POLICY_REASON" >> "$GITHUB_OUTPUT"
+            echo "precheck_skip_count=$PRECHECK_SKIPS" >> "$GITHUB_OUTPUT"
+            echo "precheck_skip_kernels=$PRECHECK_SKIP_KERNELS" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -456,6 +472,8 @@ jobs:
           echo "build_target_ubuntu_count=$UBUNTU_BUILD_TARGET_COUNT" >> "$GITHUB_OUTPUT"
           echo "family_policy_failed=$FAMILY_POLICY_FAILED" >> "$GITHUB_OUTPUT"
           echo "family_policy_reason=$FAMILY_POLICY_REASON" >> "$GITHUB_OUTPUT"
+          echo "precheck_skip_count=$PRECHECK_SKIPS" >> "$GITHUB_OUTPUT"
+          echo "precheck_skip_kernels=$PRECHECK_SKIP_KERNELS" >> "$GITHUB_OUTPUT"
 
       - name: Discover experimental channel targets
         id: discover_experimental
@@ -469,6 +487,8 @@ jobs:
           NORMALIZED_CHANNELS="$(echo "$CHANNELS_RAW" | tr '[:upper:]' '[:lower:]' | tr ',' ' ')"
           SEEN=" "
           COUNT=0
+          DISCOVERY_SKIPS=0
+          DISCOVERY_SKIP_KERNELS=""
 
           map_channel_branch() {
             case "$1" in
@@ -524,6 +544,12 @@ jobs:
                   cross=""
                   defconfig="bcm2711_defconfig"
                   ;;
+                [0-9]*.[0-9]*.[0-9]*+)
+                  apt_arch="armhf"
+                  karch="arm"
+                  cross="arm-linux-gnueabihf-"
+                  defconfig="bcmrpi_defconfig"
+                  ;;
                 *)
                   ;;
               esac
@@ -538,12 +564,16 @@ jobs:
             tree_json="$(curl -fsSL "https://api.github.com/repos/raspberrypi/firmware/git/trees/${fw_branch}?recursive=1" || true)"
             if [ -z "$tree_json" ]; then
               echo "::warning::Experimental channel '$channel' skipped: failed to query firmware tree"
+              DISCOVERY_SKIPS=$((DISCOVERY_SKIPS + 1))
+              DISCOVERY_SKIP_KERNELS="${DISCOVERY_SKIP_KERNELS:+$DISCOVERY_SKIP_KERNELS,}$channel:<discovery>(failed-firmware-tree-query)"
               return
             fi
 
             linux_hash="$(curl -fsSL "https://raw.githubusercontent.com/raspberrypi/firmware/${fw_branch}/extra/git_hash" 2>/dev/null | tr -d '[:space:]' || true)"
             if ! echo "$linux_hash" | grep -Eq '^[0-9a-f]{40}$'; then
               echo "::warning::Experimental channel '$channel' skipped: invalid linux git hash metadata"
+              DISCOVERY_SKIPS=$((DISCOVERY_SKIPS + 1))
+              DISCOVERY_SKIP_KERNELS="${DISCOVERY_SKIP_KERNELS:+$DISCOVERY_SKIP_KERNELS,}$channel:<discovery>(invalid-linux-hash)"
               return
             fi
 
@@ -552,8 +582,13 @@ jobs:
 
             if [ -z "$newest_core" ]; then
               echo "::warning::Experimental channel '$channel' skipped: no usable module target versions discovered"
+              DISCOVERY_SKIPS=$((DISCOVERY_SKIPS + 1))
+              DISCOVERY_SKIP_KERNELS="${DISCOVERY_SKIP_KERNELS:+$DISCOVERY_SKIP_KERNELS,}$channel:<discovery>(no-usable-module-versions)"
               return
             fi
+
+            echo "Experimental raw versions for channel '$channel' core '$newest_core':"
+            printf '%s\n' "$all_kvers" | awk -v c="$newest_core" 'index($0, c) == 1 { print "  - " $0 }'
 
             ADDED=0
             while IFS= read -r kver; do
@@ -563,6 +598,8 @@ jobs:
                   TARGET_META="$(infer_experimental_target "$kver" || true)"
                   if [ -z "$TARGET_META" ]; then
                     echo "::warning::Experimental channel '$channel': skipping unsupported kernel flavor '$kver'"
+                    DISCOVERY_SKIPS=$((DISCOVERY_SKIPS + 1))
+                    DISCOVERY_SKIP_KERNELS="${DISCOVERY_SKIP_KERNELS:+$DISCOVERY_SKIP_KERNELS,}$channel:$kver(discovery-unsupported-flavor)"
                     continue
                   fi
                   IFS='|' read -r APT_ARCH KARCH CROSS_COMPILE DEFCONFIG <<< "$TARGET_META"
@@ -574,6 +611,8 @@ jobs:
 
             if [ "$ADDED" -eq 0 ]; then
               echo "::warning::Experimental channel '$channel' skipped: no mappable flavors for newest core '$newest_core'"
+              DISCOVERY_SKIPS=$((DISCOVERY_SKIPS + 1))
+              DISCOVERY_SKIP_KERNELS="${DISCOVERY_SKIP_KERNELS:+$DISCOVERY_SKIP_KERNELS,}$channel:<discovery>(no-mappable-flavors)"
               return
             fi
 
@@ -594,6 +633,8 @@ jobs:
             fw_branch="$(map_channel_branch "$token")"
             if [ -z "$fw_branch" ]; then
               echo "::warning::Ignoring invalid experimental_channels token '$token'"
+              DISCOVERY_SKIPS=$((DISCOVERY_SKIPS + 1))
+              DISCOVERY_SKIP_KERNELS="${DISCOVERY_SKIP_KERNELS:+$DISCOVERY_SKIP_KERNELS,}$token:<discovery>(invalid-channel-token)"
               continue
             fi
 
@@ -605,11 +646,15 @@ jobs:
             COUNT="$(wc -l < "$TARGET_FILE" | tr -d ' ')"
             echo "has_targets=true" >> "$GITHUB_OUTPUT"
             echo "target_count=$COUNT" >> "$GITHUB_OUTPUT"
+            echo "discovery_skip_count=$DISCOVERY_SKIPS" >> "$GITHUB_OUTPUT"
+            echo "discovery_skip_kernels=$DISCOVERY_SKIP_KERNELS" >> "$GITHUB_OUTPUT"
             echo "Experimental targets (channel|kver|apt_arch|arch|cross|linux_hash|defconfig):"
             cat "$TARGET_FILE"
           else
             echo "has_targets=false" >> "$GITHUB_OUTPUT"
             echo "target_count=0" >> "$GITHUB_OUTPUT"
+            echo "discovery_skip_count=$DISCOVERY_SKIPS" >> "$GITHUB_OUTPUT"
+            echo "discovery_skip_kernels=$DISCOVERY_SKIP_KERNELS" >> "$GITHUB_OUTPUT"
             echo "No experimental channel targets discovered"
           fi
 
@@ -626,19 +671,21 @@ jobs:
           echo "Runner host architecture in build step: $HOST_ARCH"
           OKS=0
           FAILS=0
-          SKIPS=0
+          SKIPS="${{ steps.download_headers.outputs.precheck_skip_count }}"
+          [ -z "$SKIPS" ] && SKIPS=0
           TARGETS=0
           OK_KERNELS=""
           FAIL_KERNELS=""
-          SKIP_KERNELS=""
+          SKIP_KERNELS="${{ steps.download_headers.outputs.precheck_skip_kernels }}"
           EXP_BLOCKING="${{ inputs.experimental_blocking }}"
           EXP_OKS=0
           EXP_FAILS=0
-          EXP_SKIPS=0
+          EXP_SKIPS="${{ steps.discover_experimental.outputs.discovery_skip_count }}"
+          [ -z "$EXP_SKIPS" ] && EXP_SKIPS=0
           EXP_TARGETS=0
           EXP_OK_KERNELS=""
           EXP_FAIL_KERNELS=""
-          EXP_SKIP_KERNELS=""
+          EXP_SKIP_KERNELS="${{ steps.discover_experimental.outputs.discovery_skip_kernels }}"
           ARTIFACT_ROOT="${RUNNER_TEMP}/kmod-artifacts"
 
           escape_annotation() {
@@ -706,10 +753,10 @@ jobs:
             local cc_bin=""
 
             if [ -n "$cross_prefix" ]; then
-              if command -v "${cross_prefix}gcc" >/dev/null 2>&1; then
-                cc_bin="${cross_prefix}gcc"
-              elif command -v "${cross_prefix}gcc-14" >/dev/null 2>&1; then
+              if command -v "${cross_prefix}gcc-14" >/dev/null 2>&1; then
                 cc_bin="${cross_prefix}gcc-14"
+              elif command -v "${cross_prefix}gcc" >/dev/null 2>&1; then
+                cc_bin="${cross_prefix}gcc"
               elif command -v "${cross_prefix}gcc-12" >/dev/null 2>&1; then
                 cc_bin="${cross_prefix}gcc-12"
               fi
@@ -1213,6 +1260,9 @@ jobs:
 
           if [ -n "$SKIP_KERNELS" ]; then
             echo "::warning::Skipped kernels: $SKIP_KERNELS"
+          fi
+          if [ -n "$EXP_SKIP_KERNELS" ]; then
+            echo "::warning::Skipped experimental kernels: $EXP_SKIP_KERNELS"
           fi
 
           echo "::notice::Stable summary: targets=$((OKS+SKIPS+FAILS)) ok=$OKS skip=$SKIPS fail=$FAILS"
