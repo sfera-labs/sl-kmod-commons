@@ -237,6 +237,7 @@ jobs:
             kmod_log_info "Target metadata: core=$kernel_core_version arch=$target_apt_arch karch=$target_karch hash=$linux_hash_value defconfig=$target_defconfig"
 
             SRC_DIR="$SRC_BASE_DIR/${git_stream_name}-${linux_hash_value}"
+            TARGET_KEY="$git_stream_name:$kernel_flavor_version"
             if [ ! -d "$SRC_DIR/.git" ]; then
               rm -rf "$SRC_DIR"
               mkdir -p "$SRC_DIR"
@@ -244,8 +245,7 @@ jobs:
               git -C "$SRC_DIR" remote add origin https://github.com/raspberrypi/linux.git
               if ! git -C "$SRC_DIR" fetch --depth 1 origin "$linux_hash_value"; then
                 kmod_log_warn "Skipping target '$git_stream_name:$kernel_flavor_version': failed to fetch linux source $linux_hash_value"
-                SKIP_COUNT=$((SKIP_COUNT + 1))
-                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$git_stream_name:$kernel_flavor_version(fetch-failed)"
+                kmod_register_skip "$TARGET_KEY" "fetch-failed"
                 kmod_log_section_end
                 continue
               fi
@@ -257,8 +257,7 @@ jobs:
               EXP_CC_BIN="$(kmod_resolve_compiler_bin "$target_cross")"
               if [ -z "$EXP_CC_BIN" ] || ! command -v "$EXP_CC_BIN" >/dev/null 2>&1; then
                 kmod_log_warn "Skipping target '$git_stream_name:$kernel_flavor_version': compiler not found ('$EXP_CC_BIN')"
-                SKIP_COUNT=$((SKIP_COUNT + 1))
-                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$git_stream_name:$kernel_flavor_version(compiler-missing)"
+                kmod_register_skip "$TARGET_KEY" "compiler-missing"
                 kmod_log_section_end
                 continue
               fi
@@ -287,8 +286,7 @@ jobs:
                 if [ -f "$DEFCONFIG_LOG_FILE" ]; then
                   kmod_log_external_output_excerpt "defconfig attempts ($git_stream_name:$kernel_flavor_version)" "$DEFCONFIG_LOG_FILE" 220
                 fi
-                SKIP_COUNT=$((SKIP_COUNT + 1))
-                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$git_stream_name:$kernel_flavor_version(defconfig-failed)"
+                kmod_register_skip "$TARGET_KEY" "defconfig-failed"
                 kmod_log_section_end
                 continue
               fi
@@ -296,8 +294,7 @@ jobs:
               if ! kmod_run_command_capture_with_label "modules_prepare (target=$git_stream_name:$kernel_flavor_version)" "$MODULES_PREP_LOG_FILE" make -C "$SRC_DIR" ARCH="$target_karch" CROSS_COMPILE="$target_cross" CC="$EXP_CC_BIN" modules_prepare; then
                 kmod_log_warn "Skipping target '$git_stream_name:$kernel_flavor_version': modules_prepare failed"
                 kmod_log_external_output_excerpt "modules_prepare ($git_stream_name:$kernel_flavor_version)" "$MODULES_PREP_LOG_FILE" 220
-                SKIP_COUNT=$((SKIP_COUNT + 1))
-                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$git_stream_name:$kernel_flavor_version(modules-prepare-failed)"
+                kmod_register_skip "$TARGET_KEY" "modules-prepare-failed"
                 kmod_log_section_end
                 continue
               fi
@@ -308,87 +305,34 @@ jobs:
             CC_BIN="$(kmod_resolve_compiler_bin "$target_cross")"
             if [ -z "$CC_BIN" ] || ! command -v "$CC_BIN" >/dev/null 2>&1; then
               kmod_log_warn "Skipping target '$git_stream_name:$kernel_flavor_version': compiler not found ('$CC_BIN')"
-              SKIP_COUNT=$((SKIP_COUNT + 1))
-              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$git_stream_name:$kernel_flavor_version(compiler-missing)"
+              kmod_register_skip "$TARGET_KEY" "compiler-missing"
               kmod_log_section_end
               continue
             fi
-
-            sudo mkdir -p "/lib/modules/$kernel_flavor_version"
-            sudo rm -rf "/lib/modules/$kernel_flavor_version/build"
-            sudo ln -s "$SRC_DIR" "/lib/modules/$kernel_flavor_version/build"
-
-            export ARCH="$target_karch"
-            export CROSS_COMPILE="$target_cross"
-            export CC="$CC_BIN"
-            export KVER="$kernel_flavor_version"
-
-            make CC="$CC_BIN" clean || true
             MAKE_LOG_FILE="$RUNNER_TEMP/git-make-${git_stream_name}-${kernel_flavor_version}.log"
-            rm -f "$MAKE_LOG_FILE"
 
-            if kmod_run_command_capture_with_label "make CC=$CC_BIN (target=$git_stream_name:$kernel_flavor_version)" "$MAKE_LOG_FILE" make CC="$CC_BIN"; then
-              KO_COUNT="$(find . -maxdepth 1 -type f -name '*.ko' | wc -l | tr -d ' ')"
-              DTBO_COUNT="$(find . -maxdepth 1 -type f -name '*.dtbo' | wc -l | tr -d ' ')"
-
-              if [ "$KO_COUNT" -eq 0 ] || [ "$DTBO_COUNT" -eq 0 ]; then
-                kmod_log_error "Target '$git_stream_name:$kernel_flavor_version' failed: expected .ko and .dtbo outputs are required"
-                FAIL=1
-                FAIL_COUNT=$((FAIL_COUNT + 1))
-                FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$git_stream_name:$kernel_flavor_version(artifact-contract-failed)"
-              else
-                MODULE_NAME="$(find . -maxdepth 1 -type f -name '*.ko' -print | sort | head -n1 | xargs -n1 basename | sed 's/\.ko$//' || true)"
-                [ -z "$MODULE_NAME" ] && MODULE_NAME="module"
-                OUT_DIR="$ARTIFACT_ROOT/${MODULE_NAME}-${kernel_flavor_version}"
-                mkdir -p "$OUT_DIR"
-                find . -maxdepth 1 -type f -name '*.ko' -exec cp -v {} "$OUT_DIR/" \;
-                find . -maxdepth 1 -type f -name '*.dtbo' -exec cp -v {} "$OUT_DIR/" \;
-                OK_COUNT=$((OK_COUNT + 1))
-                OK_KERNELS="${OK_KERNELS:+$OK_KERNELS,}$git_stream_name:$kernel_flavor_version"
-                kmod_log_info "Target '$git_stream_name:$kernel_flavor_version' build succeeded"
-                kmod_log_notice "OK target: $git_stream_name:$kernel_flavor_version"
-              fi
-            else
-              kmod_log_info "Target '$git_stream_name:$kernel_flavor_version' failed: make returned non-zero"
-              if [ -f "$MAKE_LOG_FILE" ]; then
-                kmod_log_external_output_excerpt "make CC=$CC_BIN ($git_stream_name:$kernel_flavor_version)" "$MAKE_LOG_FILE" 220
-                ERR_SNIPPET="$(kmod_extract_make_error_snippet "$MAKE_LOG_FILE")"
-                if [ -n "$ERR_SNIPPET" ]; then
-                  ERR_ANNOTATION="$(printf '%s' "$ERR_SNIPPET" | kmod_escape_annotation)"
-                  echo "::error::Target '$git_stream_name:$kernel_flavor_version' relevant error:%0A$ERR_ANNOTATION"
-                fi
-              fi
-              FAIL=1
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-              FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$git_stream_name:$kernel_flavor_version(make-failed)"
-            fi
+            kmod_build_target_with_make \
+              "Target" \
+              "$TARGET_KEY" \
+              "$TARGET_KEY" \
+              "$kernel_flavor_version" \
+              "$SRC_DIR" \
+              "$target_cross" \
+              "$target_karch" \
+              "$ARTIFACT_ROOT" \
+              "target=$TARGET_KEY" \
+              "$MAKE_LOG_FILE" || true
 
             kmod_log_section_end
           done < "$TARGET_FILE"
 
-          kmod_log_section_begin "Git resolver summary"
-          kmod_log_info "Summary: targets=$TARGET_COUNT ok=$OK_COUNT skip=$SKIP_COUNT fail=$FAIL_COUNT"
-          [ -n "$SKIP_KERNELS" ] && kmod_log_warn "Skipped targets: $SKIP_KERNELS"
-          [ -n "$FAIL_KERNELS" ] && kmod_log_info "Failed targets: $FAIL_KERNELS"
-          kmod_log_section_end
+          kmod_log_build_counts "Git"
 
-          if [ "$TARGET_COUNT" -eq 0 ]; then
-            kmod_fail "No git targets were processed"
+          if ! kmod_finalize_build_status "$FAIL_ON_SKIP"; then
             exit 1
           fi
 
-          if [ "$FAIL_ON_SKIP" = "true" ] && [ "$SKIP_COUNT" -gt 0 ]; then
-            kmod_log_error "Skipping targets is configured as blocking and $SKIP_COUNT target(s) were skipped"
-            FAIL=1
-          fi
-
-          echo "target_count=$TARGET_COUNT" >> "$GITHUB_OUTPUT"
-          echo "ok_count=$OK_COUNT" >> "$GITHUB_OUTPUT"
-          echo "skip_count=$SKIP_COUNT" >> "$GITHUB_OUTPUT"
-          echo "fail_count=$FAIL_COUNT" >> "$GITHUB_OUTPUT"
-          echo "ok_kernels=$OK_KERNELS" >> "$GITHUB_OUTPUT"
-          echo "skip_kernels=$SKIP_KERNELS" >> "$GITHUB_OUTPUT"
-          echo "fail_kernels=$FAIL_KERNELS" >> "$GITHUB_OUTPUT"
+          kmod_emit_build_outputs
 
           exit "$FAIL"
 

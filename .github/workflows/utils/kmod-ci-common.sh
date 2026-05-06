@@ -318,6 +318,173 @@ kmod_run_command_capture_with_label() {
   return 1
 }
 
+kmod_append_csv_value() {
+  local target_var_name="$1"
+  local value="$2"
+  local current_value="${!target_var_name:-}"
+
+  if [ -n "$current_value" ]; then
+    printf -v "$target_var_name" '%s,%s' "$current_value" "$value"
+  else
+    printf -v "$target_var_name" '%s' "$value"
+  fi
+}
+
+kmod_register_skip() {
+  local target_key="$1"
+  local reason_tag="$2"
+
+  SKIP_COUNT=$((SKIP_COUNT + 1))
+  kmod_append_csv_value SKIP_KERNELS "${target_key}(${reason_tag})"
+}
+
+kmod_register_fail() {
+  local target_key="$1"
+  local reason_tag="$2"
+
+  FAIL=1
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  kmod_append_csv_value FAIL_KERNELS "${target_key}(${reason_tag})"
+}
+
+kmod_register_success() {
+  local target_key="$1"
+
+  OK_COUNT=$((OK_COUNT + 1))
+  kmod_append_csv_value OK_KERNELS "$target_key"
+}
+
+kmod_link_kernel_build_dir() {
+  local module_version="$1"
+  local kernel_build_dir="$2"
+
+  sudo mkdir -p "/lib/modules/$module_version"
+  sudo rm -rf "/lib/modules/$module_version/build"
+  sudo ln -s "$kernel_build_dir" "/lib/modules/$module_version/build"
+}
+
+kmod_resolve_module_name() {
+  local module_name
+  module_name="$(find . -maxdepth 1 -type f -name '*.ko' -print | sort | head -n1 | xargs -n1 basename | sed 's/\.ko$//' || true)"
+  [ -z "$module_name" ] && module_name="module"
+  printf '%s\n' "$module_name"
+}
+
+kmod_copy_target_artifacts() {
+  local artifact_root="$1"
+  local target_version="$2"
+  local module_name=""
+  local output_dir=""
+
+  module_name="$(kmod_resolve_module_name)"
+  output_dir="$artifact_root/${module_name}-${target_version}"
+  mkdir -p "$output_dir"
+  find . -maxdepth 1 -type f -name '*.ko' -exec cp -v {} "$output_dir/" \;
+  find . -maxdepth 1 -type f -name '*.dtbo' -exec cp -v {} "$output_dir/" \;
+}
+
+kmod_build_target_with_make() {
+  local subject_noun="$1"
+  local subject_display="$2"
+  local subject_key="$3"
+  local module_version="$4"
+  local kernel_build_dir="$5"
+  local cross_compile_prefix="$6"
+  local kernel_arch="$7"
+  local artifact_root="$8"
+  local build_context="$9"
+  local make_log_file="${10}"
+  local cc_bin=""
+  local make_label=""
+  local ko_count="0"
+  local dtbo_count="0"
+  local err_snippet=""
+  local err_annotation=""
+
+  cc_bin="$(kmod_resolve_compiler_bin "$cross_compile_prefix")"
+  if [ -z "$cc_bin" ] || ! command -v "$cc_bin" >/dev/null 2>&1; then
+    kmod_log_error "${subject_noun} '$subject_display' failed: compiler not found ('$cc_bin')"
+    kmod_register_fail "$subject_key" "compiler-missing"
+    return 1
+  fi
+
+  kmod_link_kernel_build_dir "$module_version" "$kernel_build_dir"
+
+  export ARCH="$kernel_arch"
+  export CROSS_COMPILE="$cross_compile_prefix"
+  export CC="$cc_bin"
+  export KVER="$module_version"
+
+  make CC="$cc_bin" clean || true
+  rm -f "$make_log_file"
+
+  make_label="make CC=$cc_bin ($build_context)"
+  if kmod_run_command_capture_with_label "$make_label" "$make_log_file" make CC="$cc_bin"; then
+    ko_count="$(find . -maxdepth 1 -type f -name '*.ko' | wc -l | tr -d ' ')"
+    dtbo_count="$(find . -maxdepth 1 -type f -name '*.dtbo' | wc -l | tr -d ' ')"
+
+    if [ "$ko_count" -eq 0 ] || [ "$dtbo_count" -eq 0 ]; then
+      kmod_log_error "${subject_noun} '$subject_display' failed: expected .ko and .dtbo outputs are required"
+      kmod_register_fail "$subject_key" "artifact-contract-failed"
+      return 1
+    fi
+
+    kmod_copy_target_artifacts "$artifact_root" "$module_version"
+    kmod_register_success "$subject_key"
+    kmod_log_info "${subject_noun} '$subject_display' build succeeded"
+    kmod_log_notice "OK target: $subject_display"
+    return 0
+  fi
+
+  kmod_log_info "${subject_noun} '$subject_display' failed: make returned non-zero"
+  if [ -f "$make_log_file" ]; then
+    kmod_log_external_output_excerpt "$make_label" "$make_log_file" 220
+    err_snippet="$(kmod_extract_make_error_snippet "$make_log_file")"
+    if [ -n "$err_snippet" ]; then
+      err_annotation="$(printf '%s' "$err_snippet" | kmod_escape_annotation)"
+      echo "::error::${subject_noun} '$subject_display' relevant error:%0A$err_annotation"
+    fi
+  fi
+  kmod_register_fail "$subject_key" "make-failed"
+  return 1
+}
+
+kmod_log_build_counts() {
+  local resolver_heading="$1"
+
+  kmod_log_section_begin "$resolver_heading resolver summary"
+  kmod_log_info "Summary: targets=$TARGET_COUNT ok=$OK_COUNT skip=$SKIP_COUNT fail=$FAIL_COUNT"
+  [ -n "$SKIP_KERNELS" ] && kmod_log_warn "Skipped targets: $SKIP_KERNELS"
+  [ -n "$FAIL_KERNELS" ] && kmod_log_info "Failed targets: $FAIL_KERNELS"
+  kmod_log_section_end
+}
+
+kmod_emit_build_outputs() {
+  echo "target_count=$TARGET_COUNT" >> "$GITHUB_OUTPUT"
+  echo "ok_count=$OK_COUNT" >> "$GITHUB_OUTPUT"
+  echo "skip_count=$SKIP_COUNT" >> "$GITHUB_OUTPUT"
+  echo "fail_count=$FAIL_COUNT" >> "$GITHUB_OUTPUT"
+  echo "ok_kernels=$OK_KERNELS" >> "$GITHUB_OUTPUT"
+  echo "skip_kernels=$SKIP_KERNELS" >> "$GITHUB_OUTPUT"
+  echo "fail_kernels=$FAIL_KERNELS" >> "$GITHUB_OUTPUT"
+}
+
+kmod_finalize_build_status() {
+  local fail_on_skip="$1"
+
+  if [ "$TARGET_COUNT" -eq 0 ]; then
+    kmod_fail "No targets were processed"
+    return 1
+  fi
+
+  if [ "$fail_on_skip" = "true" ] && [ "$SKIP_COUNT" -gt 0 ]; then
+    kmod_log_error "Skipping targets is configured as blocking and $SKIP_COUNT target(s) were skipped"
+    FAIL=1
+  fi
+
+  return 0
+}
+
 kmod_summary_publish_resolver() {
   local resolver_name="$1"
   local requested_sources="${2:-}"

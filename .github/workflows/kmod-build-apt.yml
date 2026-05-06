@@ -415,8 +415,7 @@ jobs:
 
             if ! apt_target_package_download "$HEADER_PACKAGE:$TARGET_APT_ARCH"; then
               kmod_log_warn "Skipping kernel '$KERNEL_VERSION': cannot download headers package '$HEADER_PACKAGE:$TARGET_APT_ARCH'"
-              SKIP_COUNT=$((SKIP_COUNT + 1))
-              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(missing-headers-package)"
+              kmod_register_skip "$KERNEL_VERSION" "missing-headers-package"
               kmod_log_section_end
               continue
             fi
@@ -427,8 +426,7 @@ jobs:
               BASE_RPT="$(echo "$KERNEL_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt' || true)"
               if [ -z "$BASE_RPT" ]; then
                 kmod_log_warn "Skipping kernel '$KERNEL_VERSION': failed to derive +rpt base"
-                SKIP_COUNT=$((SKIP_COUNT + 1))
-                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(derive-rpt-base-failed)"
+                kmod_register_skip "$KERNEL_VERSION" "derive-rpt-base-failed"
                 kmod_log_section_end
                 continue
               fi
@@ -438,8 +436,7 @@ jobs:
               if ! apt_target_package_download "$COMMON_PACKAGE:$TARGET_APT_ARCH" \
                 && ! apt_target_package_download "$COMMON_PACKAGE"; then
                 kmod_log_warn "Skipping kernel '$KERNEL_VERSION': cannot download common headers package '$COMMON_PACKAGE'"
-                SKIP_COUNT=$((SKIP_COUNT + 1))
-                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(missing-common-headers-package)"
+                kmod_register_skip "$KERNEL_VERSION" "missing-common-headers-package"
                 kmod_log_section_end
                 continue
               fi
@@ -463,8 +460,7 @@ jobs:
             fi
             if [ "$KBUILD_OK" -ne 1 ]; then
               kmod_log_warn "Skipping kernel '$KERNEL_VERSION': cannot download kbuild package '$KBUILD_PACKAGE'"
-              SKIP_COUNT=$((SKIP_COUNT + 1))
-              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(missing-kbuild-package)"
+              kmod_register_skip "$KERNEL_VERSION" "missing-kbuild-package"
               kmod_log_section_end
               continue
             fi
@@ -487,8 +483,7 @@ jobs:
 
             if [ -z "$HEADERS_DEB" ] || [ -z "$KBUILD_DEB" ] || { [ -n "$COMMON_PACKAGE" ] && [ -z "$COMMON_DEB" ]; }; then
               kmod_log_warn "Skipping kernel '$KERNEL_VERSION': downloaded files could not be resolved"
-              SKIP_COUNT=$((SKIP_COUNT + 1))
-              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(downloaded-file-resolution-failed)"
+              kmod_register_skip "$KERNEL_VERSION" "downloaded-file-resolution-failed"
               kmod_log_section_end
               continue
             fi
@@ -497,22 +492,19 @@ jobs:
             mkdir root
             if ! dpkg-deb -x "$HEADERS_DEB" root/; then
               kmod_log_warn "Skipping kernel '$KERNEL_VERSION': failed to extract headers"
-              SKIP_COUNT=$((SKIP_COUNT + 1))
-              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(headers-extract-failed)"
+              kmod_register_skip "$KERNEL_VERSION" "headers-extract-failed"
               kmod_log_section_end
               continue
             fi
             if [ -n "$COMMON_DEB" ] && ! dpkg-deb -x "$COMMON_DEB" root/; then
               kmod_log_warn "Skipping kernel '$KERNEL_VERSION': failed to extract common headers"
-              SKIP_COUNT=$((SKIP_COUNT + 1))
-              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(common-extract-failed)"
+              kmod_register_skip "$KERNEL_VERSION" "common-extract-failed"
               kmod_log_section_end
               continue
             fi
             if ! dpkg-deb -x "$KBUILD_DEB" root/; then
               kmod_log_warn "Skipping kernel '$KERNEL_VERSION': failed to extract kbuild package"
-              SKIP_COUNT=$((SKIP_COUNT + 1))
-              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(kbuild-extract-failed)"
+              kmod_register_skip "$KERNEL_VERSION" "kbuild-extract-failed"
               kmod_log_section_end
               continue
             fi
@@ -532,8 +524,7 @@ jobs:
                 ;;
               *)
                 kmod_log_warn "Skipping kernel '$KERNEL_VERSION': unsupported target architecture '$TARGET_APT_ARCH'"
-                SKIP_COUNT=$((SKIP_COUNT + 1))
-                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(unsupported-target-arch)"
+                kmod_register_skip "$KERNEL_VERSION" "unsupported-target-arch"
                 kmod_log_section_end
                 continue
                 ;;
@@ -548,8 +539,7 @@ jobs:
 
             if [ -z "$HEADER_DIR_NAME" ]; then
               kmod_log_warn "Skipping kernel '$KERNEL_VERSION': header directory not found after extraction"
-              SKIP_COUNT=$((SKIP_COUNT + 1))
-              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(header-dir-missing)"
+              kmod_register_skip "$KERNEL_VERSION" "header-dir-missing"
               kmod_log_section_end
               continue
             fi
@@ -557,91 +547,29 @@ jobs:
             KDIR_PATH="$GITHUB_WORKSPACE/root/usr/src/$HEADER_DIR_NAME"
             sudo rm -rf /usr/src
             sudo ln -s "$GITHUB_WORKSPACE/root/usr/src" /usr/src
-            sudo mkdir -p "/lib/modules/$KERNEL_VERSION"
-            sudo rm -rf "/lib/modules/$KERNEL_VERSION/build"
-            sudo ln -s "$KDIR_PATH" "/lib/modules/$KERNEL_VERSION/build"
-
-            CC_BIN="$(kmod_resolve_compiler_bin "$CROSS_COMPILE")"
-            if [ -z "$CC_BIN" ] || ! command -v "$CC_BIN" >/dev/null 2>&1; then
-              kmod_log_error "Kernel '$KERNEL_VERSION' failed: compiler not found ('$CC_BIN')"
-              FAIL=1
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-              FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KERNEL_VERSION(compiler-missing)"
-              kmod_log_section_end
-              continue
-            fi
-
-            export ARCH="$KARCH"
-            export CROSS_COMPILE="$CROSS_COMPILE"
-            export CC="$CC_BIN"
-            export KVER="$KERNEL_VERSION"
-
-            make CC="$CC_BIN" clean || true
             MAKE_LOG_FILE="$RUNNER_TEMP/apt-make-${KERNEL_VERSION}.log"
-            rm -f "$MAKE_LOG_FILE"
-
-            if kmod_run_command_capture_with_label "make CC=$CC_BIN (kernel=$KERNEL_VERSION)" "$MAKE_LOG_FILE" make CC="$CC_BIN"; then
-              KO_COUNT="$(find . -maxdepth 1 -type f -name '*.ko' | wc -l | tr -d ' ')"
-              DTBO_COUNT="$(find . -maxdepth 1 -type f -name '*.dtbo' | wc -l | tr -d ' ')"
-
-              if [ "$KO_COUNT" -eq 0 ] || [ "$DTBO_COUNT" -eq 0 ]; then
-                kmod_log_error "Kernel '$KERNEL_VERSION' failed: expected .ko and .dtbo outputs are required"
-                FAIL=1
-                FAIL_COUNT=$((FAIL_COUNT + 1))
-                FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KERNEL_VERSION(artifact-contract-failed)"
-              else
-                MODULE_NAME="$(find . -maxdepth 1 -type f -name '*.ko' -print | sort | head -n1 | xargs -n1 basename | sed 's/\.ko$//' || true)"
-                [ -z "$MODULE_NAME" ] && MODULE_NAME="module"
-                OUT_DIR="$ARTIFACT_ROOT/${MODULE_NAME}-${KERNEL_VERSION}"
-                mkdir -p "$OUT_DIR"
-                find . -maxdepth 1 -type f -name '*.ko' -exec cp -v {} "$OUT_DIR/" \;
-                find . -maxdepth 1 -type f -name '*.dtbo' -exec cp -v {} "$OUT_DIR/" \;
-                OK_COUNT=$((OK_COUNT + 1))
-                OK_KERNELS="${OK_KERNELS:+$OK_KERNELS,}$KERNEL_VERSION"
-                kmod_log_info "Kernel '$KERNEL_VERSION' build succeeded"
-                kmod_log_notice "OK target: $KERNEL_VERSION"
-              fi
-            else
-              kmod_log_info "Kernel '$KERNEL_VERSION' failed: make returned non-zero"
-              if [ -f "$MAKE_LOG_FILE" ]; then
-                kmod_log_external_output_excerpt "make CC=$CC_BIN" "$MAKE_LOG_FILE" 220
-                ERR_SNIPPET="$(kmod_extract_make_error_snippet "$MAKE_LOG_FILE")"
-                if [ -n "$ERR_SNIPPET" ]; then
-                  ERR_ANNOTATION="$(printf '%s' "$ERR_SNIPPET" | kmod_escape_annotation)"
-                  echo "::error::Kernel '$KERNEL_VERSION' relevant error:%0A$ERR_ANNOTATION"
-                fi
-              fi
-              FAIL=1
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-              FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KERNEL_VERSION(make-failed)"
-            fi
+            kmod_build_target_with_make \
+              "Kernel" \
+              "$KERNEL_VERSION" \
+              "$KERNEL_VERSION" \
+              "$KERNEL_VERSION" \
+              "$KDIR_PATH" \
+              "$CROSS_COMPILE" \
+              "$KARCH" \
+              "$ARTIFACT_ROOT" \
+              "kernel=$KERNEL_VERSION" \
+              "$MAKE_LOG_FILE" || true
 
             kmod_log_section_end
           done < "$TARGET_FILE"
 
-          kmod_log_section_begin "Apt resolver summary"
-          kmod_log_info "Summary: targets=$TARGET_COUNT ok=$OK_COUNT skip=$SKIP_COUNT fail=$FAIL_COUNT"
-          [ -n "$SKIP_KERNELS" ] && kmod_log_warn "Skipped targets: $SKIP_KERNELS"
-          [ -n "$FAIL_KERNELS" ] && kmod_log_info "Failed targets: $FAIL_KERNELS"
-          kmod_log_section_end
+          kmod_log_build_counts "Apt"
 
-          if [ "$TARGET_COUNT" -eq 0 ]; then
-            kmod_fail "No apt targets were processed"
+          if ! kmod_finalize_build_status "$FAIL_ON_SKIP"; then
             exit 1
           fi
 
-          if [ "$FAIL_ON_SKIP" = "true" ] && [ "$SKIP_COUNT" -gt 0 ]; then
-            kmod_log_error "Skipping targets is configured as blocking and $SKIP_COUNT target(s) were skipped"
-            FAIL=1
-          fi
-
-          echo "target_count=$TARGET_COUNT" >> "$GITHUB_OUTPUT"
-          echo "ok_count=$OK_COUNT" >> "$GITHUB_OUTPUT"
-          echo "skip_count=$SKIP_COUNT" >> "$GITHUB_OUTPUT"
-          echo "fail_count=$FAIL_COUNT" >> "$GITHUB_OUTPUT"
-          echo "ok_kernels=$OK_KERNELS" >> "$GITHUB_OUTPUT"
-          echo "skip_kernels=$SKIP_KERNELS" >> "$GITHUB_OUTPUT"
-          echo "fail_kernels=$FAIL_KERNELS" >> "$GITHUB_OUTPUT"
+          kmod_emit_build_outputs
 
           exit "$FAIL"
 
