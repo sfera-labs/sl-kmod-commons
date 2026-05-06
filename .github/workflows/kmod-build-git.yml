@@ -337,13 +337,16 @@ jobs:
                 FAIL_COUNT=$((FAIL_COUNT + 1))
                 FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$git_stream_name:$kernel_flavor_version(artifact-contract-failed)"
               else
-                OUT_DIR="$ARTIFACT_ROOT/$git_stream_name/$target_apt_arch/module-artifacts-$kernel_flavor_version"
+                MODULE_NAME="$(find . -maxdepth 1 -type f -name '*.ko' -print | sort | head -n1 | xargs -n1 basename | sed 's/\.ko$//' || true)"
+                [ -z "$MODULE_NAME" ] && MODULE_NAME="module"
+                OUT_DIR="$ARTIFACT_ROOT/${MODULE_NAME}-${kernel_flavor_version}"
                 mkdir -p "$OUT_DIR"
                 find . -maxdepth 1 -type f -name '*.ko' -exec cp -v {} "$OUT_DIR/" \;
                 find . -maxdepth 1 -type f -name '*.dtbo' -exec cp -v {} "$OUT_DIR/" \;
                 OK_COUNT=$((OK_COUNT + 1))
                 OK_KERNELS="${OK_KERNELS:+$OK_KERNELS,}$git_stream_name:$kernel_flavor_version"
                 kmod_log_info "Target '$git_stream_name:$kernel_flavor_version' build succeeded"
+                kmod_log_notice "OK target: $git_stream_name:$kernel_flavor_version"
               fi
             else
               kmod_log_info "Target '$git_stream_name:$kernel_flavor_version' failed: make returned non-zero"

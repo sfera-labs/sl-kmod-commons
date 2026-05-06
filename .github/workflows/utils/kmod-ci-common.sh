@@ -15,6 +15,10 @@ kmod_log_info() {
   echo "[kmod-ci][info] $*"
 }
 
+kmod_log_notice() {
+  echo "::notice::[kmod-ci] $*"
+}
+
 kmod_log_warn() {
   echo "::warning::[kmod-ci] $*"
 }
@@ -136,6 +140,36 @@ kmod_tokens_to_csv() {
   fi
 
   printf '%s\n' "$token_input" | awk 'NF > 0' | paste -sd',' -
+}
+
+kmod_csv_to_markdown_list() {
+  local label="$1"
+  local csv_values="${2:-}"
+
+  if [ -z "$csv_values" ]; then
+    echo "- ${label}: none"
+    return 0
+  fi
+
+  echo "- ${label}:"
+  printf '%s\n' "$csv_values" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | sed '/^$/d' | while IFS= read -r item; do
+    echo "  - $item"
+  done
+}
+
+kmod_log_csv_list() {
+  local label="$1"
+  local csv_values="${2:-}"
+
+  if [ -z "$csv_values" ]; then
+    kmod_log_info "${label}: none"
+    return 0
+  fi
+
+  kmod_log_info "${label}:"
+  printf '%s\n' "$csv_values" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | sed '/^$/d' | while IFS= read -r item; do
+    kmod_log_info "  - $item"
+  done
 }
 
 kmod_parse_resolver_sources() {
@@ -304,28 +338,28 @@ kmod_summary_publish_resolver() {
   [ -z "$fail_count" ] && fail_count=0
 
   # Log summary to workflow logs
-  kmod_log_section_begin "${resolver_name} resolver compatibility summary"
+  kmod_log_section_begin "${resolver_name} resolver summary"
   kmod_log_info "Requested sources: ${requested_sources:-none}"
   kmod_log_info "Resolved sources: ${resolved_sources:-none}"
   kmod_log_info "Requested streams: ${requested_streams:-none}"
   kmod_log_info "Resolved streams: ${resolved_streams:-none}"
-  kmod_log_info "Resolved cores: ${resolved_cores:-none}"
-  kmod_log_info "Resolved flavors: ${resolved_flavors:-none}"
+  kmod_log_csv_list "Resolved cores" "$resolved_cores"
+  kmod_log_csv_list "Resolved flavors" "$resolved_flavors"
   kmod_log_info "Result counts: targets=$target_count ok=$ok_count skip=$skip_count fail=$fail_count"
   kmod_log_section_end
 
   # Write summary to GitHub Step Summary markdown
   {
-    # Capitalize resolver name for heading
-    local heading_name=$(printf '%s' "$resolver_name" | sed 's/^./\U&/')
-    echo "### ${heading_name} Resolver Compatibility Summary"
-    echo ""
+    local heading_name
+    heading_name=$(printf '%s' "$resolver_name" | sed 's/^./\U&/')
+    echo "- Resolver: $heading_name"
     echo "- Requested sources: ${requested_sources:-none}"
     echo "- Resolved sources: ${resolved_sources:-none}"
     echo "- Requested streams: ${requested_streams:-none}"
     echo "- Resolved streams: ${resolved_streams:-none}"
-    echo "- Resolved kernel cores: ${resolved_cores:-none}"
-    echo "- Resolved kernel flavors: ${resolved_flavors:-none}"
+    kmod_csv_to_markdown_list "Resolved kernel cores" "$resolved_cores"
+    kmod_csv_to_markdown_list "Resolved kernel flavors" "$resolved_flavors"
     echo "- Build counts: targets=$target_count ok=$ok_count skip=$skip_count fail=$fail_count"
+    echo ""
   } >> "$GITHUB_STEP_SUMMARY"
 }

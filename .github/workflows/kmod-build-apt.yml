@@ -590,13 +590,16 @@ jobs:
                 FAIL_COUNT=$((FAIL_COUNT + 1))
                 FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KERNEL_VERSION(artifact-contract-failed)"
               else
-                OUT_DIR="$ARTIFACT_ROOT/$TARGET_APT_ARCH/module-artifacts-$KERNEL_VERSION"
+                MODULE_NAME="$(find . -maxdepth 1 -type f -name '*.ko' -print | sort | head -n1 | xargs -n1 basename | sed 's/\.ko$//' || true)"
+                [ -z "$MODULE_NAME" ] && MODULE_NAME="module"
+                OUT_DIR="$ARTIFACT_ROOT/${MODULE_NAME}-${KERNEL_VERSION}"
                 mkdir -p "$OUT_DIR"
                 find . -maxdepth 1 -type f -name '*.ko' -exec cp -v {} "$OUT_DIR/" \;
                 find . -maxdepth 1 -type f -name '*.dtbo' -exec cp -v {} "$OUT_DIR/" \;
                 OK_COUNT=$((OK_COUNT + 1))
                 OK_KERNELS="${OK_KERNELS:+$OK_KERNELS,}$KERNEL_VERSION"
                 kmod_log_info "Kernel '$KERNEL_VERSION' build succeeded"
+                kmod_log_notice "OK target: $KERNEL_VERSION"
               fi
             else
               kmod_log_info "Kernel '$KERNEL_VERSION' failed: make returned non-zero"
