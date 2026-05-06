@@ -1,0 +1,42 @@
+name: Install Build Dependencies
+description: Install build tools, compilers, and cross-compilation toolchains required for kernel module compilation
+
+inputs:
+  include_git:
+    description: Whether to include git in the package list (for git resolver workflows)
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Install dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+        kmod_log_section_begin "Install dependencies"
+        kmod_log_info "Runner host architecture: $(dpkg --print-architecture)"
+        
+        sudo apt update
+        
+        # Install core build tools and utilities
+        BUILD_TOOLS="build-essential jq curl xz-utils gnupg gcc-12 gcc-14 device-tree-compiler"
+        [ "${{ inputs.include_git }}" = "true" ] && BUILD_TOOLS="$BUILD_TOOLS git"
+        
+        sudo apt install -y $BUILD_TOOLS
+        
+        # Install cross-compilation toolchains for ARM
+        sudo apt install -y gcc-12-arm-linux-gnueabihf gcc-14-arm-linux-gnueabihf
+
+        # Create symlink for arm-linux-gnueabihf-gcc if not present
+        if ! command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
+          if command -v arm-linux-gnueabihf-gcc-14 >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-14)" /usr/local/bin/arm-linux-gnueabihf-gcc
+          elif command -v arm-linux-gnueabihf-gcc-12 >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-12)" /usr/local/bin/arm-linux-gnueabihf-gcc
+          fi
+        fi
+        
+        kmod_log_section_end

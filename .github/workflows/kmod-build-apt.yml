@@ -7,10 +7,13 @@ on:
         required: false
         type: string
         default: '.'
-      apt_sources:
+      sources:
+        required: true
+        type: string
+      streams:
         required: false
         type: string
-        default: 'rpi-archive'
+        default: ''
       kernel_versions:
         required: false
         type: string
@@ -37,24 +40,9 @@ jobs:
           path: .kmod-ci-commons
 
       - name: Install dependencies
-        run: |
-          set -euo pipefail
-          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
-
-          kmod_log_section_begin "Install dependencies"
-          kmod_log_info "Runner host architecture: $(dpkg --print-architecture)"
-          sudo apt update
-          sudo apt install -y build-essential jq curl xz-utils gnupg gcc-12 gcc-14 device-tree-compiler
-          sudo apt install -y gcc-12-arm-linux-gnueabihf gcc-14-arm-linux-gnueabihf
-
-          if ! command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
-            if command -v arm-linux-gnueabihf-gcc-14 >/dev/null 2>&1; then
-              sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-14)" /usr/local/bin/arm-linux-gnueabihf-gcc
-            elif command -v arm-linux-gnueabihf-gcc-12 >/dev/null 2>&1; then
-              sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-12)" /usr/local/bin/arm-linux-gnueabihf-gcc
-            fi
-          fi
-          kmod_log_section_end
+        uses: ./.kmod-ci-commons/.github/workflows/actions/install-build-deps
+        with:
+          include_git: 'false'
 
       - name: Enable apt architectures
         run: |
@@ -69,11 +57,16 @@ jobs:
           kmod_log_section_end
 
       - name: Configure apt sources
+        id: configure_sources
         run: |
           set -euo pipefail
           source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
 
-          APT_SOURCES_RAW="${{ inputs.apt_sources }}"
+          SOURCES_RAW="${{ inputs.sources }}"
+          STREAMS_RAW="${{ inputs.streams }}"
+
+          REQUESTED_SOURCES_NL="$(kmod_parse_resolver_sources apt "$SOURCES_RAW")"
+          RESOLVED_SOURCES_CSV="$(kmod_tokens_to_csv "$REQUESTED_SOURCES_NL")"
           INCLUDE_RPI_ARCHIVE=0
           INCLUDE_UBUNTU_ARCHIVE=0
 
@@ -86,11 +79,8 @@ jobs:
               ubuntu-archive)
                 INCLUDE_UBUNTU_ARCHIVE=1
                 ;;
-              *)
-                kmod_log_warn "Ignoring invalid apt source '$source_name'"
-                ;;
             esac
-          done < <(kmod_parse_csv_tokens "$APT_SOURCES_RAW" true)
+          done < <(printf '%s\n' "$REQUESTED_SOURCES_NL")
 
           if [ "$INCLUDE_RPI_ARCHIVE" -eq 0 ] && [ "$INCLUDE_UBUNTU_ARCHIVE" -eq 0 ]; then
             kmod_fail "No valid apt sources were configured; valid values are rpi-archive, ubuntu-archive"
@@ -98,22 +88,43 @@ jobs:
           fi
 
           kmod_log_section_begin "Configure apt sources"
-          kmod_log_info "Resolved apt sources: rpi-archive=$INCLUDE_RPI_ARCHIVE ubuntu-archive=$INCLUDE_UBUNTU_ARCHIVE"
+          kmod_log_requested_resolved_scope "apt" "$RESOLVED_SOURCES_CSV" "$RESOLVED_SOURCES_CSV" "" ""
+
+          DISTRO_INFO_URL="https://salsa.debian.org/debian/distro-info-data/-/raw/main/debian.csv"
+          TODAY="$(date -u +%F)"
+          STABLE_SUITE=""
+          OLDSTABLE_SUITE=""
+          NEXT_SUITE=""
+          RESOLVED_STREAMS_NL=""
+
+          repo_suite_exists() {
+            local suite_name="$1"
+            curl -fsSI "http://archive.raspberrypi.org/debian/dists/$suite_name/InRelease" >/dev/null \
+              || curl -fsSI "http://archive.raspberrypi.org/debian/dists/$suite_name/Release" >/dev/null
+          }
+
+          repo_suite_has_linux_headers() {
+            local suite_name="$1"
+            local package_index_url=""
+
+            for apt_arch in arm64 armhf; do
+              for package_index_ext in xz gz ""; do
+                package_index_url="http://archive.raspberrypi.org/debian/dists/${suite_name}/main/binary-${apt_arch}/Packages"
+                [ -n "$package_index_ext" ] && package_index_url="${package_index_url}.${package_index_ext}"
+
+                if curl -fsSL "$package_index_url" 2>/dev/null \
+                  | { [ "$package_index_ext" = "xz" ] && xz -dc || [ "$package_index_ext" = "gz" ] && gzip -dc || cat; } \
+                  | grep -q '^Package: linux-headers-'; then
+                  return 0
+                fi
+              done
+            done
+
+            return 1
+          }
 
           if [ "$INCLUDE_RPI_ARCHIVE" -eq 1 ]; then
-            DISTRO_INFO_URL="https://salsa.debian.org/debian/distro-info-data/-/raw/main/debian.csv"
-            TODAY="$(date -u +%F)"
-
-            repo_suite_exists() {
-              local suite_name="$1"
-              curl -fsSI "http://archive.raspberrypi.org/debian/dists/$suite_name/InRelease" >/dev/null \
-                || curl -fsSI "http://archive.raspberrypi.org/debian/dists/$suite_name/Release" >/dev/null
-            }
-
             DISTRO_INFO="$(curl -fsSL "$DISTRO_INFO_URL" || true)"
-            STABLE_SUITE=""
-            OLDSTABLE_SUITE=""
-            NEXT_SUITE=""
 
             if [ -n "$DISTRO_INFO" ]; then
               STABLE_SUITE="$(printf '%s\n' "$DISTRO_INFO" | awk -F',' -v today="$TODAY" 'NR > 1 && $5 != "" && $5 <= today { if ($5 > max) { max=$5; code=tolower($2) } } END { print code }')"
@@ -126,41 +137,64 @@ jobs:
               kmod_log_warn "Failed to resolve stable suite from distro-info; falling back to '$STABLE_SUITE'"
             fi
 
-            CANDIDATE_SUITES_RAW="$STABLE_SUITE $OLDSTABLE_SUITE $NEXT_SUITE"
-            ENABLED_SUITES=""
-            SEEN_SUITES=" "
-            for suite_name in $CANDIDATE_SUITES_RAW; do
-              suite_name="$(echo "$suite_name" | xargs | tr '[:upper:]' '[:lower:]')"
-              [ -z "$suite_name" ] && continue
+            if [ -n "$STREAMS_RAW" ]; then
+              REQUESTED_STREAMS_NL="$(kmod_parse_csv_tokens "$STREAMS_RAW" true)"
+            else
+              REQUESTED_STREAMS_NL="stable"
+            fi
 
-              case " $SEEN_SUITES " in
-                *" $suite_name "*)
-                  continue
-                  ;;
-              esac
-              SEEN_SUITES="$SEEN_SUITES$suite_name "
-
-              if repo_suite_exists "$suite_name"; then
-                ENABLED_SUITES="${ENABLED_SUITES:+$ENABLED_SUITES }$suite_name"
-              else
-                kmod_log_warn "Skipping unavailable Raspberry Pi suite '$suite_name'"
+            while IFS= read -r stream_name; do
+              [ -z "$stream_name" ] && continue
+              suite_name="$(kmod_apt_resolve_stream_to_suite "$stream_name" "$STABLE_SUITE" "$OLDSTABLE_SUITE" "$NEXT_SUITE")"
+              if [ -z "$suite_name" ]; then
+                kmod_fail "Requested apt stream '$stream_name' could not be resolved to a suite"
+                exit 1
               fi
-            done
 
-            if [ -z "$ENABLED_SUITES" ]; then
-              kmod_fail "No usable Raspberry Pi repository suites were found"
+              if ! repo_suite_exists "$suite_name"; then
+                kmod_fail "Resolved apt suite '$suite_name' (from stream '$stream_name') is unavailable"
+                exit 1
+              fi
+
+              if ! repo_suite_has_linux_headers "$suite_name"; then
+                kmod_fail "Resolved apt suite '$suite_name' (from stream '$stream_name') has no linux-headers packages"
+                exit 1
+              fi
+
+              RESOLVED_STREAMS_NL="$(printf '%s\n%s\n' "$RESOLVED_STREAMS_NL" "$suite_name" | awk 'NF > 0 && !seen[$0]++')"
+            done < <(printf '%s\n' "$REQUESTED_STREAMS_NL")
+
+            if [ -z "$RESOLVED_STREAMS_NL" ]; then
+              kmod_fail "No apt suites were resolved from requested streams"
               exit 1
             fi
 
             : | sudo tee /etc/apt/sources.list.d/raspi.list >/dev/null
-            for suite_name in $ENABLED_SUITES; do
+            while IFS= read -r suite_name; do
+              [ -z "$suite_name" ] && continue
               echo "deb http://archive.raspberrypi.org/debian/ $suite_name main" | sudo tee -a /etc/apt/sources.list.d/raspi.list >/dev/null
-            done
+            done < <(printf '%s\n' "$RESOLVED_STREAMS_NL")
             curl -fsSL https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/raspberrypi.gpg
+          else
+            if [ -n "$STREAMS_RAW" ]; then
+              kmod_fail "Input 'streams' requires source 'rpi-archive'; current sources resolve to '${RESOLVED_SOURCES_CSV:-none}'"
+              exit 1
+            fi
+            REQUESTED_STREAMS_NL=""
+            RESOLVED_STREAMS_NL=""
           fi
+
+          REQUESTED_STREAMS_CSV="$(kmod_tokens_to_csv "$REQUESTED_STREAMS_NL")"
+          RESOLVED_STREAMS_CSV="$(kmod_tokens_to_csv "$RESOLVED_STREAMS_NL")"
+
+          kmod_log_requested_resolved_scope "apt" "$RESOLVED_SOURCES_CSV" "$RESOLVED_SOURCES_CSV" "$REQUESTED_STREAMS_CSV" "$RESOLVED_STREAMS_CSV"
 
           sudo apt-get update --allow-releaseinfo-change
           kmod_log_section_end
+
+          echo "include_rpi_archive=$INCLUDE_RPI_ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "include_ubuntu_archive=$INCLUDE_UBUNTU_ARCHIVE" >> "$GITHUB_OUTPUT"
+          kmod_emit_requested_resolved_outputs "$RESOLVED_SOURCES_CSV" "$RESOLVED_SOURCES_CSV" "$REQUESTED_STREAMS_CSV" "$RESOLVED_STREAMS_CSV"
 
       - name: Discover apt targets
         id: discover
@@ -168,18 +202,14 @@ jobs:
           set -euo pipefail
           source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
 
-          APT_SOURCES_RAW="${{ inputs.apt_sources }}"
+          REQUESTED_SOURCES="${{ steps.configure_sources.outputs.requested_source_list }}"
+          RESOLVED_SOURCES="${{ steps.configure_sources.outputs.resolved_source_list }}"
+          REQUESTED_STREAMS="${{ steps.configure_sources.outputs.requested_stream_list }}"
+          RESOLVED_STREAMS="${{ steps.configure_sources.outputs.resolved_stream_list }}"
           KERNEL_VERSIONS_RAW="${{ inputs.kernel_versions }}"
 
-          INCLUDE_RPI_ARCHIVE=0
-          INCLUDE_UBUNTU_ARCHIVE=0
-          while IFS= read -r source_name; do
-            [ -z "$source_name" ] && continue
-            case "$source_name" in
-              rpi-archive) INCLUDE_RPI_ARCHIVE=1 ;;
-              ubuntu-archive) INCLUDE_UBUNTU_ARCHIVE=1 ;;
-            esac
-          done < <(kmod_parse_csv_tokens "$APT_SOURCES_RAW" true)
+          INCLUDE_RPI_ARCHIVE="${{ steps.configure_sources.outputs.include_rpi_archive }}"
+          INCLUDE_UBUNTU_ARCHIVE="${{ steps.configure_sources.outputs.include_ubuntu_archive }}"
 
           CANDIDATE_FILE="$GITHUB_WORKSPACE/apt-candidates.txt"
           SELECTED_FILE="$GITHUB_WORKSPACE/apt-targets.txt"
@@ -284,12 +314,20 @@ jobs:
 
           TARGET_COUNT="$(wc -l < "$SELECTED_FILE" | tr -d ' ')"
           [ -z "$TARGET_COUNT" ] && TARGET_COUNT=0
+          RESOLVED_CORE_LIST="$(awk -F'|' '{ print $5 }' "$SELECTED_FILE" | sort -uV | paste -sd',' -)"
+          RESOLVED_FLAVOR_LIST="$(awk -F'|' '{ print $1 }' "$SELECTED_FILE" | sort -uV | paste -sd',' -)"
 
+          kmod_log_requested_resolved_scope "apt" "$REQUESTED_SOURCES" "$RESOLVED_SOURCES" "$REQUESTED_STREAMS" "$RESOLVED_STREAMS"
           kmod_log_info "Discovered apt targets: $TARGET_COUNT"
+          kmod_log_info "Resolved apt cores: ${RESOLVED_CORE_LIST:-none}"
+          kmod_log_info "Resolved apt flavors: ${RESOLVED_FLAVOR_LIST:-none}"
           cat "$SELECTED_FILE"
           kmod_log_section_end
 
           echo "target_count=$TARGET_COUNT" >> "$GITHUB_OUTPUT"
+          kmod_emit_requested_resolved_outputs "$REQUESTED_SOURCES" "$RESOLVED_SOURCES" "$REQUESTED_STREAMS" "$RESOLVED_STREAMS"
+          echo "resolved_core_list=$RESOLVED_CORE_LIST" >> "$GITHUB_OUTPUT"
+          echo "resolved_flavor_list=$RESOLVED_FLAVOR_LIST" >> "$GITHUB_OUTPUT"
 
       - name: Build against apt targets
         id: build
@@ -572,46 +610,38 @@ jobs:
 
           exit "$FAIL"
 
-      - name: Upload artifacts
-        if: always() && steps.build.outcome != 'skipped'
-        uses: actions/upload-artifact@v6
-        with:
-          name: kmod-artifacts-apt
-          path: ${{ runner.temp }}/kmod-artifacts/apt/
-
-      - name: Show final status
+      - name: Publish resolver summary
         if: always()
         run: |
           set -euo pipefail
           source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
 
+          REQUESTED_SOURCES="${{ steps.discover.outputs.requested_source_list }}"
+          RESOLVED_SOURCES="${{ steps.discover.outputs.resolved_source_list }}"
+          REQUESTED_STREAMS="${{ steps.discover.outputs.requested_stream_list }}"
+          RESOLVED_STREAMS="${{ steps.discover.outputs.resolved_stream_list }}"
+          RESOLVED_CORES="${{ steps.discover.outputs.resolved_core_list }}"
+          RESOLVED_FLAVORS="${{ steps.discover.outputs.resolved_flavor_list }}"
           TARGETS="${{ steps.build.outputs.target_count }}"
           OKS="${{ steps.build.outputs.ok_count }}"
           SKIPS="${{ steps.build.outputs.skip_count }}"
           FAILS="${{ steps.build.outputs.fail_count }}"
-          [ -z "$TARGETS" ] && TARGETS=0
-          [ -z "$OKS" ] && OKS=0
-          [ -z "$SKIPS" ] && SKIPS=0
-          [ -z "$FAILS" ] && FAILS=0
 
-          if [ "${{ steps.build.outcome }}" = "failure" ]; then
-            kmod_log_error "FAIL: apt resolver build step failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
-            exit 1
-          fi
+          kmod_summary_publish_resolver "apt" "$REQUESTED_SOURCES" "$RESOLVED_SOURCES" "$REQUESTED_STREAMS" "$RESOLVED_STREAMS" "$RESOLVED_CORES" "$RESOLVED_FLAVORS" "$TARGETS" "$OKS" "$SKIPS" "$FAILS"
 
-          if [ "$FAILS" -gt 0 ]; then
-            kmod_log_error "FAIL: one or more apt targets failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
-            exit 1
-          fi
+      - name: Upload artifacts
+        uses: ./.kmod-ci-commons/.github/workflows/actions/upload-build-artifacts
+        with:
+          resolver: 'apt'
 
-          if [ "${{ inputs.fail_on_skip }}" = "true" ] && [ "$SKIPS" -gt 0 ]; then
-            kmod_log_error "FAIL: skip targets are blocking and skip_count=$SKIPS"
-            exit 1
-          fi
-
-          if [ "$OKS" -gt 0 ]; then
-            kmod_log_info "OK: apt resolver completed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
-          else
-            kmod_log_error "FAIL: apt resolver produced no successful targets"
-            exit 1
-          fi
+      - name: Show final status
+        if: always()
+        uses: ./.kmod-ci-commons/.github/workflows/actions/show-build-status
+        with:
+          resolver: 'apt'
+          build_outcome: ${{ steps.build.outcome }}
+          target_count: ${{ steps.build.outputs.target_count }}
+          ok_count: ${{ steps.build.outputs.ok_count }}
+          skip_count: ${{ steps.build.outputs.skip_count }}
+          fail_count: ${{ steps.build.outputs.fail_count }}
+          fail_on_skip: ${{ inputs.fail_on_skip }}

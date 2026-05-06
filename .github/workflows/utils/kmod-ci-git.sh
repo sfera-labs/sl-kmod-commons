@@ -2,19 +2,15 @@
 
 # Git resolver specific helpers for kernel-module CI workflows.
 
-kmod_git_channel_branch_map() {
-  local git_channel_name="$1"
-  case "$git_channel_name" in
-    firmware-next|rpi-update-next)
-      printf '%s\n' "next"
-      ;;
-    firmware-main|rpi-update-main)
-      printf '%s\n' "master"
-      ;;
-    *)
-      printf '%s\n' ""
-      ;;
-  esac
+kmod_git_default_branch() {
+  local repo_api_url="https://api.github.com/repos/raspberrypi/firmware"
+  local response_file="$1"
+
+  if ! curl -fsSL "$repo_api_url" > "$response_file"; then
+    return 1
+  fi
+
+  jq -r '.default_branch // empty' "$response_file"
 }
 
 kmod_git_infer_target_meta() {

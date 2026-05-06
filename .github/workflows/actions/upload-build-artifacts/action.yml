@@ -1,0 +1,17 @@
+name: Upload Build Artifacts
+description: Upload kernel module build artifacts to GitHub Actions artifacts storage
+
+inputs:
+  resolver:
+    description: The resolver name (apt or git) used to determine artifact directory and name
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Upload artifacts
+      if: always() && steps.build.outcome != 'skipped'
+      uses: actions/upload-artifact@v6
+      with:
+        name: kmod-artifacts-${{ inputs.resolver }}
+        path: ${{ runner.temp }}/kmod-artifacts/${{ inputs.resolver }}/

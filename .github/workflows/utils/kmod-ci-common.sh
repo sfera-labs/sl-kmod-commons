@@ -128,6 +128,100 @@ kmod_parse_csv_tokens() {
   fi
 }
 
+kmod_tokens_to_csv() {
+  local token_input="${1:-}"
+  if [ -z "$token_input" ]; then
+    printf '%s\n' ""
+    return 0
+  fi
+
+  printf '%s\n' "$token_input" | awk 'NF > 0' | paste -sd',' -
+}
+
+kmod_parse_resolver_sources() {
+  local resolver_name="$1"
+  local raw_sources="$2"
+
+  if [ -z "$raw_sources" ]; then
+    kmod_fail "Input 'sources' is required for resolver '$resolver_name'"
+    return 1
+  fi
+
+  while IFS= read -r source_name; do
+    [ -z "$source_name" ] && continue
+
+    case "$resolver_name:$source_name" in
+      apt:rpi-archive|apt:ubuntu-archive|git:rpi-firmware)
+        printf '%s\n' "$source_name"
+        ;;
+      *)
+        kmod_fail "Invalid source '$source_name' for resolver '$resolver_name'"
+        return 1
+        ;;
+    esac
+  done < <(kmod_parse_csv_tokens "$raw_sources" true)
+}
+
+kmod_assert_non_empty_stream_candidates() {
+  local stream_label="$1"
+  local candidate_count="$2"
+  if [ -z "$candidate_count" ] || [ "$candidate_count" -le 0 ]; then
+    kmod_fail "Resolved stream '$stream_label' produced no discovery candidates"
+    return 1
+  fi
+}
+
+kmod_apt_resolve_stream_to_suite() {
+  local stream_name="$1"
+  local stable_suite="$2"
+  local oldstable_suite="$3"
+  local next_suite="$4"
+  local suite_name=""
+
+  case "$stream_name" in
+    stable)
+      suite_name="$stable_suite"
+      ;;
+    oldstable)
+      suite_name="$oldstable_suite"
+      ;;
+    next)
+      suite_name="$next_suite"
+      ;;
+    *)
+      suite_name="$stream_name"
+      ;;
+  esac
+
+  suite_name="$(printf '%s' "$suite_name" | xargs | tr '[:upper:]' '[:lower:]')"
+  printf '%s\n' "$suite_name"
+}
+
+kmod_log_requested_resolved_scope() {
+  local resolver_name="$1"
+  local requested_sources="$2"
+  local resolved_sources="$3"
+  local requested_streams="$4"
+  local resolved_streams="$5"
+
+  kmod_log_info "Requested ${resolver_name} sources: ${requested_sources:-none}"
+  kmod_log_info "Resolved ${resolver_name} sources: ${resolved_sources:-none}"
+  kmod_log_info "Requested ${resolver_name} streams: ${requested_streams:-none}"
+  kmod_log_info "Resolved ${resolver_name} streams: ${resolved_streams:-none}"
+}
+
+kmod_emit_requested_resolved_outputs() {
+  local requested_sources="$1"
+  local resolved_sources="$2"
+  local requested_streams="$3"
+  local resolved_streams="$4"
+
+  echo "requested_source_list=$requested_sources" >> "$GITHUB_OUTPUT"
+  echo "resolved_source_list=$resolved_sources" >> "$GITHUB_OUTPUT"
+  echo "requested_stream_list=$requested_streams" >> "$GITHUB_OUTPUT"
+  echo "resolved_stream_list=$resolved_streams" >> "$GITHUB_OUTPUT"
+}
+
 kmod_run_command_capture() {
   local log_file="$1"
   shift
@@ -187,4 +281,50 @@ kmod_run_command_capture_with_label() {
 
   kmod_log_warn "External command failed: $external_command_label"
   return 1
+}
+
+kmod_summary_publish_resolver() {
+  local resolver_name="$1"
+  local requested_sources="${2:-}"
+  local resolved_sources="${3:-}"
+  local requested_streams="${4:-}"
+  local resolved_streams="${5:-}"
+  local resolved_cores="${6:-}"
+  local resolved_flavors="${7:-}"
+  local target_count="${8:-0}"
+  local ok_count="${9:-0}"
+  local skip_count="${10:-0}"
+  local fail_count="${11:-0}"
+
+  # Ensure all counters are integers
+  [ -z "$target_count" ] && target_count=0
+  [ -z "$ok_count" ] && ok_count=0
+  [ -z "$skip_count" ] && skip_count=0
+  [ -z "$fail_count" ] && fail_count=0
+
+  # Log summary to workflow logs
+  kmod_log_section_begin "${resolver_name} resolver compatibility summary"
+  kmod_log_info "Requested sources: ${requested_sources:-none}"
+  kmod_log_info "Resolved sources: ${resolved_sources:-none}"
+  kmod_log_info "Requested streams: ${requested_streams:-none}"
+  kmod_log_info "Resolved streams: ${resolved_streams:-none}"
+  kmod_log_info "Resolved cores: ${resolved_cores:-none}"
+  kmod_log_info "Resolved flavors: ${resolved_flavors:-none}"
+  kmod_log_info "Result counts: targets=$target_count ok=$ok_count skip=$skip_count fail=$fail_count"
+  kmod_log_section_end
+
+  # Write summary to GitHub Step Summary markdown
+  {
+    # Capitalize resolver name for heading
+    local heading_name=$(printf '%s' "$resolver_name" | sed 's/^./\U&/')
+    echo "### ${heading_name} Resolver Compatibility Summary"
+    echo ""
+    echo "- Requested sources: ${requested_sources:-none}"
+    echo "- Resolved sources: ${resolved_sources:-none}"
+    echo "- Requested streams: ${requested_streams:-none}"
+    echo "- Resolved streams: ${resolved_streams:-none}"
+    echo "- Resolved kernel cores: ${resolved_cores:-none}"
+    echo "- Resolved kernel flavors: ${resolved_flavors:-none}"
+    echo "- Build counts: targets=$target_count ok=$ok_count skip=$skip_count fail=$fail_count"
+  } >> "$GITHUB_STEP_SUMMARY"
 }

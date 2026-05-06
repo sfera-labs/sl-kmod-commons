@@ -1,0 +1,74 @@
+name: Show Build Status
+description: Check build results and report final status based on target counts and configuration
+
+inputs:
+  resolver:
+    description: The resolver name (apt or git) for status messages
+    required: true
+  build_outcome:
+    description: The outcome of the build step ('success', 'failure', or 'skipped')
+    required: true
+  target_count:
+    description: Total number of targets processed
+    required: false
+    default: '0'
+  ok_count:
+    description: Number of successfully built targets
+    required: false
+    default: '0'
+  skip_count:
+    description: Number of skipped targets
+    required: false
+    default: '0'
+  fail_count:
+    description: Number of failed targets
+    required: false
+    default: '0'
+  fail_on_skip:
+    description: Whether to treat skipped targets as failures
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Show final status
+      shell: bash
+      run: |
+        set -euo pipefail
+        source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+        TARGETS="${{ inputs.target_count }}"
+        OKS="${{ inputs.ok_count }}"
+        SKIPS="${{ inputs.skip_count }}"
+        FAILS="${{ inputs.fail_count }}"
+        RESOLVER="${{ inputs.resolver }}"
+        BUILD_OUTCOME="${{ inputs.build_outcome }}"
+        FAIL_ON_SKIP="${{ inputs.fail_on_skip }}"
+        
+        [ -z "$TARGETS" ] && TARGETS=0
+        [ -z "$OKS" ] && OKS=0
+        [ -z "$SKIPS" ] && SKIPS=0
+        [ -z "$FAILS" ] && FAILS=0
+
+        if [ "$BUILD_OUTCOME" = "failure" ]; then
+          kmod_log_error "FAIL: $RESOLVER resolver build step failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
+          exit 1
+        fi
+
+        if [ "$FAILS" -gt 0 ]; then
+          kmod_log_error "FAIL: one or more $RESOLVER targets failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
+          exit 1
+        fi
+
+        if [ "$FAIL_ON_SKIP" = "true" ] && [ "$SKIPS" -gt 0 ]; then
+          kmod_log_error "FAIL: skip targets are blocking and skip_count=$SKIPS"
+          exit 1
+        fi
+
+        if [ "$OKS" -gt 0 ]; then
+          kmod_log_info "OK: $RESOLVER resolver completed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
+        else
+          kmod_log_error "FAIL: $RESOLVER resolver produced no successful targets"
+          exit 1
+        fi
