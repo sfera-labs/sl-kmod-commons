@@ -52,23 +52,23 @@ runs:
         [ -z "$FAILS" ] && FAILS=0
 
         if [ "$BUILD_OUTCOME" = "failure" ]; then
-          kmod_log_error "FAIL: $RESOLVER resolver build step failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
+          kmod_log_info "FAIL: $RESOLVER resolver workflow failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
           exit 1
         fi
 
         if [ "$FAILS" -gt 0 ]; then
-          kmod_log_error "FAIL: one or more $RESOLVER targets failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
+          kmod_log_info "FAIL: one or more $RESOLVER targets failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
           exit 1
         fi
 
         if [ "$FAIL_ON_SKIP" = "true" ] && [ "$SKIPS" -gt 0 ]; then
-          kmod_log_error "FAIL: skip targets are blocking and skip_count=$SKIPS"
+          kmod_log_info "FAIL: skip targets are blocking and skip_count=$SKIPS"
           exit 1
         fi
 
         if [ "$OKS" -gt 0 ]; then
           kmod_log_info "OK: $RESOLVER resolver completed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
         else
-          kmod_log_error "FAIL: $RESOLVER resolver produced no successful targets"
+          kmod_log_info "FAIL: $RESOLVER resolver produced no successful targets"
           exit 1
         fi

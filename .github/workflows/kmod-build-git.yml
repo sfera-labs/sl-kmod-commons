@@ -346,7 +346,7 @@ jobs:
                 kmod_log_info "Target '$git_stream_name:$kernel_flavor_version' build succeeded"
               fi
             else
-              kmod_log_error "Target '$git_stream_name:$kernel_flavor_version' failed: make returned non-zero"
+              kmod_log_info "Target '$git_stream_name:$kernel_flavor_version' failed: make returned non-zero"
               if [ -f "$MAKE_LOG_FILE" ]; then
                 kmod_log_external_output_excerpt "make CC=$CC_BIN ($git_stream_name:$kernel_flavor_version)" "$MAKE_LOG_FILE" 220
                 ERR_SNIPPET="$(kmod_extract_make_error_snippet "$MAKE_LOG_FILE")"
@@ -366,7 +366,7 @@ jobs:
           kmod_log_section_begin "Git resolver summary"
           kmod_log_info "Summary: targets=$TARGET_COUNT ok=$OK_COUNT skip=$SKIP_COUNT fail=$FAIL_COUNT"
           [ -n "$SKIP_KERNELS" ] && kmod_log_warn "Skipped targets: $SKIP_KERNELS"
-          [ -n "$FAIL_KERNELS" ] && kmod_log_error "Failed targets: $FAIL_KERNELS"
+          [ -n "$FAIL_KERNELS" ] && kmod_log_info "Failed targets: $FAIL_KERNELS"
           kmod_log_section_end
 
           if [ "$TARGET_COUNT" -eq 0 ]; then
@@ -405,6 +405,19 @@ jobs:
           OKS="${{ steps.build.outputs.ok_count }}"
           SKIPS="${{ steps.build.outputs.skip_count }}"
           FAILS="${{ steps.build.outputs.fail_count }}"
+
+          if [ "${{ steps.discover.outcome }}" = "failure" ] || [ "${{ steps.build.outcome }}" = "failure" ]; then
+            [ -z "$FAILS" ] && FAILS=1
+            if [ "$FAILS" -eq 0 ]; then
+              FAILS=1
+            fi
+          fi
+
+          if [ "${{ steps.discover.outcome }}" = "failure" ]; then
+            kmod_log_info "Summary context: git discovery failed before build completed"
+          elif [ "${{ steps.build.outcome }}" = "failure" ]; then
+            kmod_log_info "Summary context: git build step failed"
+          fi
 
           kmod_summary_publish_resolver "git" "$REQUESTED_SOURCES" "$RESOLVED_SOURCES" "$REQUESTED_STREAMS" "$RESOLVED_STREAMS" "$RESOLVED_CORES" "$RESOLVED_FLAVORS" "$TARGETS" "$OKS" "$SKIPS" "$FAILS"
 

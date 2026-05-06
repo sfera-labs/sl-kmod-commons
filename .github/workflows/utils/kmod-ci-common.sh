@@ -279,7 +279,8 @@ kmod_run_command_capture_with_label() {
     return 0
   fi
 
-  kmod_log_warn "External command failed: $external_command_label"
+  # Keep failure visible in logs but avoid spamming workflow annotations.
+  kmod_log_info "External command failed: $external_command_label"
   return 1
 }
 

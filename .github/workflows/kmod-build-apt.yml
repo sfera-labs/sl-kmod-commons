@@ -106,15 +106,39 @@ jobs:
           repo_suite_has_linux_headers() {
             local suite_name="$1"
             local package_index_url=""
+            local package_index_file=""
+            local package_plain_file=""
+
+            package_index_file="$(mktemp)"
+            package_plain_file="$(mktemp)"
+
+            cleanup_package_probe_files() {
+              rm -f "$package_index_file" "$package_plain_file"
+            }
+            trap cleanup_package_probe_files RETURN
 
             for apt_arch in arm64 armhf; do
               for package_index_ext in xz gz ""; do
                 package_index_url="http://archive.raspberrypi.org/debian/dists/${suite_name}/main/binary-${apt_arch}/Packages"
                 [ -n "$package_index_ext" ] && package_index_url="${package_index_url}.${package_index_ext}"
 
-                if curl -fsSL "$package_index_url" 2>/dev/null \
-                  | { [ "$package_index_ext" = "xz" ] && xz -dc || [ "$package_index_ext" = "gz" ] && gzip -dc || cat; } \
-                  | grep -q '^Package: linux-headers-'; then
+                if ! curl -fsSL "$package_index_url" -o "$package_index_file" 2>/dev/null; then
+                  continue
+                fi
+
+                if [ "$package_index_ext" = "xz" ]; then
+                  if ! xz -dc "$package_index_file" > "$package_plain_file" 2>/dev/null; then
+                    continue
+                  fi
+                elif [ "$package_index_ext" = "gz" ]; then
+                  if ! gzip -dc "$package_index_file" > "$package_plain_file" 2>/dev/null; then
+                    continue
+                  fi
+                else
+                  cp "$package_index_file" "$package_plain_file"
+                fi
+
+                if grep -q '^Package: linux-headers-' "$package_plain_file"; then
                   return 0
                 fi
               done
@@ -151,6 +175,11 @@ jobs:
                 exit 1
               fi
 
+              kmod_log_info "Resolved apt stream '$stream_name' -> suite '$suite_name'"
+              REQUESTED_STREAMS_CSV_PROGRESS="$(kmod_tokens_to_csv "$REQUESTED_STREAMS_NL")"
+              RESOLVED_STREAMS_CSV_PROGRESS="$(kmod_tokens_to_csv "$RESOLVED_STREAMS_NL")"
+              kmod_emit_requested_resolved_outputs "$RESOLVED_SOURCES_CSV" "$RESOLVED_SOURCES_CSV" "$REQUESTED_STREAMS_CSV_PROGRESS" "$RESOLVED_STREAMS_CSV_PROGRESS"
+
               if ! repo_suite_exists "$suite_name"; then
                 kmod_fail "Resolved apt suite '$suite_name' (from stream '$stream_name') is unavailable"
                 exit 1
@@ -186,6 +215,9 @@ jobs:
 
           REQUESTED_STREAMS_CSV="$(kmod_tokens_to_csv "$REQUESTED_STREAMS_NL")"
           RESOLVED_STREAMS_CSV="$(kmod_tokens_to_csv "$RESOLVED_STREAMS_NL")"
+
+          # Emit early to preserve visibility in downstream summary steps even if update fails.
+          kmod_emit_requested_resolved_outputs "$RESOLVED_SOURCES_CSV" "$RESOLVED_SOURCES_CSV" "$REQUESTED_STREAMS_CSV" "$RESOLVED_STREAMS_CSV"
 
           kmod_log_requested_resolved_scope "apt" "$RESOLVED_SOURCES_CSV" "$RESOLVED_SOURCES_CSV" "$REQUESTED_STREAMS_CSV" "$RESOLVED_STREAMS_CSV"
 
@@ -567,7 +599,7 @@ jobs:
                 kmod_log_info "Kernel '$KERNEL_VERSION' build succeeded"
               fi
             else
-              kmod_log_error "Kernel '$KERNEL_VERSION' failed: make returned non-zero"
+              kmod_log_info "Kernel '$KERNEL_VERSION' failed: make returned non-zero"
               if [ -f "$MAKE_LOG_FILE" ]; then
                 kmod_log_external_output_excerpt "make CC=$CC_BIN" "$MAKE_LOG_FILE" 220
                 ERR_SNIPPET="$(kmod_extract_make_error_snippet "$MAKE_LOG_FILE")"
@@ -587,7 +619,7 @@ jobs:
           kmod_log_section_begin "Apt resolver summary"
           kmod_log_info "Summary: targets=$TARGET_COUNT ok=$OK_COUNT skip=$SKIP_COUNT fail=$FAIL_COUNT"
           [ -n "$SKIP_KERNELS" ] && kmod_log_warn "Skipped targets: $SKIP_KERNELS"
-          [ -n "$FAIL_KERNELS" ] && kmod_log_error "Failed targets: $FAIL_KERNELS"
+          [ -n "$FAIL_KERNELS" ] && kmod_log_info "Failed targets: $FAIL_KERNELS"
           kmod_log_section_end
 
           if [ "$TARGET_COUNT" -eq 0 ]; then
@@ -617,15 +649,40 @@ jobs:
           source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
 
           REQUESTED_SOURCES="${{ steps.discover.outputs.requested_source_list }}"
+          [ -z "$REQUESTED_SOURCES" ] && REQUESTED_SOURCES="${{ steps.configure_sources.outputs.requested_source_list }}"
+          [ -z "$REQUESTED_SOURCES" ] && REQUESTED_SOURCES="${{ inputs.sources }}"
+
           RESOLVED_SOURCES="${{ steps.discover.outputs.resolved_source_list }}"
+          [ -z "$RESOLVED_SOURCES" ] && RESOLVED_SOURCES="${{ steps.configure_sources.outputs.resolved_source_list }}"
+
           REQUESTED_STREAMS="${{ steps.discover.outputs.requested_stream_list }}"
+          [ -z "$REQUESTED_STREAMS" ] && REQUESTED_STREAMS="${{ steps.configure_sources.outputs.requested_stream_list }}"
+          [ -z "$REQUESTED_STREAMS" ] && REQUESTED_STREAMS="${{ inputs.streams }}"
+
           RESOLVED_STREAMS="${{ steps.discover.outputs.resolved_stream_list }}"
+          [ -z "$RESOLVED_STREAMS" ] && RESOLVED_STREAMS="${{ steps.configure_sources.outputs.resolved_stream_list }}"
+
           RESOLVED_CORES="${{ steps.discover.outputs.resolved_core_list }}"
           RESOLVED_FLAVORS="${{ steps.discover.outputs.resolved_flavor_list }}"
           TARGETS="${{ steps.build.outputs.target_count }}"
           OKS="${{ steps.build.outputs.ok_count }}"
           SKIPS="${{ steps.build.outputs.skip_count }}"
           FAILS="${{ steps.build.outputs.fail_count }}"
+
+          if [ "${{ steps.configure_sources.outcome }}" = "failure" ] || [ "${{ steps.discover.outcome }}" = "failure" ] || [ "${{ steps.build.outcome }}" = "failure" ]; then
+            [ -z "$FAILS" ] && FAILS=1
+            if [ "$FAILS" -eq 0 ]; then
+              FAILS=1
+            fi
+          fi
+
+          if [ "${{ steps.configure_sources.outcome }}" = "failure" ]; then
+            kmod_log_info "Summary context: apt configuration failed before discovery/build completed"
+          elif [ "${{ steps.discover.outcome }}" = "failure" ]; then
+            kmod_log_info "Summary context: apt discovery failed before build completed"
+          elif [ "${{ steps.build.outcome }}" = "failure" ]; then
+            kmod_log_info "Summary context: apt build step failed"
+          fi
 
           kmod_summary_publish_resolver "apt" "$REQUESTED_SOURCES" "$RESOLVED_SOURCES" "$REQUESTED_STREAMS" "$RESOLVED_STREAMS" "$RESOLVED_CORES" "$RESOLVED_FLAVORS" "$TARGETS" "$OKS" "$SKIPS" "$FAILS"
 
@@ -639,7 +696,7 @@ jobs:
         uses: ./.kmod-ci-commons/.github/workflows/actions/show-build-status
         with:
           resolver: 'apt'
-          build_outcome: ${{ steps.build.outcome }}
+          build_outcome: ${{ steps.configure_sources.outcome == 'failure' && 'failure' || steps.discover.outcome == 'failure' && 'failure' || steps.build.outcome }}
           target_count: ${{ steps.build.outputs.target_count }}
           ok_count: ${{ steps.build.outputs.ok_count }}
           skip_count: ${{ steps.build.outputs.skip_count }}
