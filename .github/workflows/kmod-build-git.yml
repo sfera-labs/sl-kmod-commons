@@ -1,0 +1,412 @@
+name: Kernel Module Build (git resolver)
+
+on:
+  workflow_call:
+    inputs:
+      module_path:
+        required: false
+        type: string
+        default: '.'
+      git_channels:
+        required: false
+        type: string
+        default: 'firmware-next,firmware-main'
+      kernel_versions:
+        required: false
+        type: string
+        default: ''
+      fail_on_skip:
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout module repo
+        uses: actions/checkout@v5
+
+      - name: Checkout CI utilities repo
+        # Assumption: reusable workflows are consumed from sl-kmod-commons main branch.
+        uses: actions/checkout@v5
+        with:
+          repository: sfera-labs/sl-kmod-commons
+          ref: main
+          path: .kmod-ci-commons
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+          kmod_log_section_begin "Install dependencies"
+          kmod_log_info "Runner host architecture: $(dpkg --print-architecture)"
+          sudo apt update
+          sudo apt install -y build-essential jq curl xz-utils gnupg git gcc-12 gcc-14 device-tree-compiler
+          sudo apt install -y gcc-12-arm-linux-gnueabihf gcc-14-arm-linux-gnueabihf
+
+          if ! command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
+            if command -v arm-linux-gnueabihf-gcc-14 >/dev/null 2>&1; then
+              sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-14)" /usr/local/bin/arm-linux-gnueabihf-gcc
+            elif command -v arm-linux-gnueabihf-gcc-12 >/dev/null 2>&1; then
+              sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-12)" /usr/local/bin/arm-linux-gnueabihf-gcc
+            fi
+          fi
+          kmod_log_section_end
+
+      - name: Discover git targets
+        id: discover
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-git.sh"
+
+          GIT_CHANNELS_RAW="${{ inputs.git_channels }}"
+          KERNEL_VERSIONS_RAW="${{ inputs.kernel_versions }}"
+
+          CANDIDATE_FILE="$GITHUB_WORKSPACE/git-candidates.txt"
+          SELECTED_FILE="$GITHUB_WORKSPACE/git-targets.txt"
+          rm -f "$CANDIDATE_FILE" "$SELECTED_FILE"
+          : > "$CANDIDATE_FILE"
+
+          kmod_log_section_begin "Discover git candidates"
+          while IFS= read -r git_channel_name; do
+            [ -z "$git_channel_name" ] && continue
+
+            firmware_branch_name="$(kmod_git_channel_branch_map "$git_channel_name")"
+            if [ -z "$firmware_branch_name" ]; then
+              kmod_log_warn "Ignoring invalid git channel '$git_channel_name'"
+              continue
+            fi
+
+            kmod_log_info "Discovering channel '$git_channel_name' from firmware branch '$firmware_branch_name'"
+            tree_json_file="$RUNNER_TEMP/git-tree-${git_channel_name}.json"
+            firmware_hash_file="$RUNNER_TEMP/git-hash-${git_channel_name}.txt"
+            tree_query_log_file="$RUNNER_TEMP/git-tree-query-${git_channel_name}.log"
+            hash_query_log_file="$RUNNER_TEMP/git-hash-query-${git_channel_name}.log"
+            versions_extract_log_file="$RUNNER_TEMP/git-versions-extract-${git_channel_name}.log"
+            versions_file="$RUNNER_TEMP/git-versions-${git_channel_name}.txt"
+
+            if ! curl -fsSL "https://api.github.com/repos/raspberrypi/firmware/git/trees/${firmware_branch_name}?recursive=1" > "$tree_json_file" 2>"$tree_query_log_file"; then
+              kmod_log_warn "Skipping channel '$git_channel_name': failed to query firmware tree"
+              kmod_log_external_output_excerpt "curl firmware tree ($git_channel_name)" "$tree_query_log_file" 120
+              continue
+            fi
+
+            if ! curl -fsSL "https://raw.githubusercontent.com/raspberrypi/firmware/${firmware_branch_name}/extra/git_hash" > "$firmware_hash_file" 2>"$hash_query_log_file"; then
+              kmod_log_warn "Skipping channel '$git_channel_name': failed to fetch linux hash metadata"
+              kmod_log_external_output_excerpt "curl firmware hash ($git_channel_name)" "$hash_query_log_file" 120
+              continue
+            fi
+
+            linux_hash_value="$(tr -d '[:space:]' < "$firmware_hash_file")"
+            if ! echo "$linux_hash_value" | grep -Eq '^[0-9a-f]{40}$'; then
+              kmod_log_warn "Skipping channel '$git_channel_name': invalid linux hash metadata '$linux_hash_value'"
+              kmod_log_external_output_excerpt "firmware hash payload ($git_channel_name)" "$firmware_hash_file" 20
+              continue
+            fi
+
+            if ! jq -r '.tree[].path' "$tree_json_file" | sed -n 's#^modules/\([^/]*\)/.*#\1#p' | sort -uV > "$versions_file" 2>"$versions_extract_log_file"; then
+              kmod_log_warn "Skipping channel '$git_channel_name': failed to parse module versions from firmware tree"
+              kmod_log_external_output_excerpt "jq module versions parse ($git_channel_name)" "$versions_extract_log_file" 120
+              kmod_log_external_output_excerpt "firmware tree payload ($git_channel_name)" "$tree_json_file" 80
+              continue
+            fi
+
+            while IFS= read -r kernel_flavor_version; do
+              [ -z "$kernel_flavor_version" ] && continue
+              kernel_core_version="$(echo "$kernel_flavor_version" | sed -n 's#^\([0-9]\+\.[0-9]\+\.[0-9]\+\).*$#\1#p')"
+              [ -z "$kernel_core_version" ] && continue
+
+              target_meta="$(kmod_git_infer_target_meta "$kernel_flavor_version" || true)"
+              if [ -z "$target_meta" ]; then
+                kmod_log_warn "Channel '$git_channel_name': unsupported kernel flavor '$kernel_flavor_version'"
+                continue
+              fi
+
+              IFS='|' read -r target_apt_arch target_karch target_cross target_defconfig <<< "$target_meta"
+              echo "$git_channel_name|$kernel_flavor_version|$kernel_core_version|$target_apt_arch|$target_karch|$target_cross|$linux_hash_value|$target_defconfig" >> "$CANDIDATE_FILE"
+            done < "$versions_file"
+          done < <(kmod_parse_csv_tokens "$GIT_CHANNELS_RAW" true)
+
+          sort -u "$CANDIDATE_FILE" -o "$CANDIDATE_FILE"
+          if [ ! -s "$CANDIDATE_FILE" ]; then
+            kmod_fail "Discovery produced no git candidates"
+            exit 1
+          fi
+
+          : > "$SELECTED_FILE"
+
+          if [ -n "$KERNEL_VERSIONS_RAW" ]; then
+            kmod_log_info "Selector mode: explicit"
+            while IFS= read -r version_token; do
+              [ -z "$version_token" ] && continue
+
+              if echo "$version_token" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                awk -F'|' -v core="$version_token" '$3 == core { print }' "$CANDIDATE_FILE" >> "$SELECTED_FILE"
+              elif echo "$version_token" | grep -Eq '[+-]'; then
+                awk -F'|' -v flavor="$version_token" '$2 == flavor { print }' "$CANDIDATE_FILE" >> "$SELECTED_FILE"
+              else
+                kmod_log_warn "Ignoring invalid kernel_versions token '$version_token'"
+              fi
+            done < <(kmod_parse_csv_tokens "$KERNEL_VERSIONS_RAW" false)
+          else
+            kmod_log_info "Selector mode: auto"
+            awk -F'|' '{ print $1 }' "$CANDIDATE_FILE" | sort -u | while IFS= read -r git_channel_name; do
+              [ -z "$git_channel_name" ] && continue
+              newest_core="$(awk -F'|' -v c="$git_channel_name" '$1 == c { print $3 }' "$CANDIDATE_FILE" | sort -uV | tail -n 1 || true)"
+              [ -z "$newest_core" ] && continue
+              awk -F'|' -v c="$git_channel_name" -v core="$newest_core" '$1 == c && $3 == core { print }' "$CANDIDATE_FILE" >> "$SELECTED_FILE"
+            done
+          fi
+
+          sort -u "$SELECTED_FILE" -o "$SELECTED_FILE"
+          if [ ! -s "$SELECTED_FILE" ]; then
+            kmod_fail "Selector produced no git targets"
+            exit 1
+          fi
+
+          TARGET_COUNT="$(wc -l < "$SELECTED_FILE" | tr -d ' ')"
+          [ -z "$TARGET_COUNT" ] && TARGET_COUNT=0
+
+          kmod_log_info "Discovered git targets: $TARGET_COUNT"
+          cat "$SELECTED_FILE"
+          kmod_log_section_end
+
+          echo "target_count=$TARGET_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Build against git targets
+        id: build
+        working-directory: ${{ inputs.module_path }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-git.sh"
+
+          TARGET_FILE="$GITHUB_WORKSPACE/git-targets.txt"
+          SRC_BASE_DIR="$RUNNER_TEMP/git-kernel-sources"
+          ARTIFACT_ROOT="$RUNNER_TEMP/kmod-artifacts/git"
+          FAIL_ON_SKIP="${{ inputs.fail_on_skip }}"
+
+          OK_COUNT=0
+          FAIL_COUNT=0
+          SKIP_COUNT=0
+          TARGET_COUNT=0
+          OK_KERNELS=""
+          FAIL_KERNELS=""
+          SKIP_KERNELS=""
+          FAIL=0
+
+          rm -rf "$SRC_BASE_DIR" "$ARTIFACT_ROOT"
+          mkdir -p "$SRC_BASE_DIR" "$ARTIFACT_ROOT"
+
+          if [ ! -s "$TARGET_FILE" ]; then
+            kmod_fail "Target file is missing or empty before build"
+            exit 1
+          fi
+
+          while IFS='|' read -r git_channel_name kernel_flavor_version kernel_core_version target_apt_arch target_karch target_cross linux_hash_value target_defconfig; do
+            [ -z "$kernel_flavor_version" ] && continue
+            TARGET_COUNT=$((TARGET_COUNT + 1))
+
+            kmod_log_section_begin "Build target $git_channel_name:$kernel_flavor_version"
+            kmod_log_info "Target metadata: core=$kernel_core_version arch=$target_apt_arch karch=$target_karch hash=$linux_hash_value defconfig=$target_defconfig"
+
+            SRC_DIR="$SRC_BASE_DIR/${git_channel_name}-${linux_hash_value}"
+            if [ ! -d "$SRC_DIR/.git" ]; then
+              rm -rf "$SRC_DIR"
+              mkdir -p "$SRC_DIR"
+              git init "$SRC_DIR"
+              git -C "$SRC_DIR" remote add origin https://github.com/raspberrypi/linux.git
+              if ! git -C "$SRC_DIR" fetch --depth 1 origin "$linux_hash_value"; then
+                kmod_log_warn "Skipping target '$git_channel_name:$kernel_flavor_version': failed to fetch linux source $linux_hash_value"
+                SKIP_COUNT=$((SKIP_COUNT + 1))
+                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$git_channel_name:$kernel_flavor_version(fetch-failed)"
+                kmod_log_section_end
+                continue
+              fi
+              git -C "$SRC_DIR" checkout -q FETCH_HEAD
+            fi
+
+            PREP_STAMP="$SRC_DIR/.prepared-${target_karch}-${target_defconfig}"
+            if [ ! -f "$PREP_STAMP" ]; then
+              EXP_CC_BIN="$(kmod_resolve_compiler_bin "$target_cross")"
+              if [ -z "$EXP_CC_BIN" ] || ! command -v "$EXP_CC_BIN" >/dev/null 2>&1; then
+                kmod_log_warn "Skipping target '$git_channel_name:$kernel_flavor_version': compiler not found ('$EXP_CC_BIN')"
+                SKIP_COUNT=$((SKIP_COUNT + 1))
+                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$git_channel_name:$kernel_flavor_version(compiler-missing)"
+                kmod_log_section_end
+                continue
+              fi
+
+              APPLIED_DEFCONFIG=""
+              DEFCONFIG_TRIED=""
+              DEFCONFIG_LOG_FILE="$RUNNER_TEMP/git-defconfig-${git_channel_name}-${kernel_flavor_version}.log"
+              MODULES_PREP_LOG_FILE="$RUNNER_TEMP/git-modules-prepare-${git_channel_name}-${kernel_flavor_version}.log"
+
+              while IFS= read -r candidate_defconfig_name; do
+                [ -z "$candidate_defconfig_name" ] && continue
+                DEFCONFIG_TRIED="${DEFCONFIG_TRIED:+$DEFCONFIG_TRIED,}$candidate_defconfig_name"
+
+                if [ ! -f "$SRC_DIR/arch/$target_karch/configs/$candidate_defconfig_name" ]; then
+                  continue
+                fi
+
+                if kmod_run_command_capture_with_label "defconfig $candidate_defconfig_name (target=$git_channel_name:$kernel_flavor_version)" "$DEFCONFIG_LOG_FILE" make -C "$SRC_DIR" ARCH="$target_karch" CROSS_COMPILE="$target_cross" CC="$EXP_CC_BIN" "$candidate_defconfig_name"; then
+                  APPLIED_DEFCONFIG="$candidate_defconfig_name"
+                  break
+                fi
+              done < <(kmod_git_defconfig_candidates "$target_karch" "$target_defconfig")
+
+              if [ -z "$APPLIED_DEFCONFIG" ]; then
+                kmod_log_warn "Skipping target '$git_channel_name:$kernel_flavor_version': failed to apply defconfig (attempted: $DEFCONFIG_TRIED)"
+                if [ -f "$DEFCONFIG_LOG_FILE" ]; then
+                  kmod_log_external_output_excerpt "defconfig attempts ($git_channel_name:$kernel_flavor_version)" "$DEFCONFIG_LOG_FILE" 220
+                fi
+                SKIP_COUNT=$((SKIP_COUNT + 1))
+                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$git_channel_name:$kernel_flavor_version(defconfig-failed)"
+                kmod_log_section_end
+                continue
+              fi
+
+              if ! kmod_run_command_capture_with_label "modules_prepare (target=$git_channel_name:$kernel_flavor_version)" "$MODULES_PREP_LOG_FILE" make -C "$SRC_DIR" ARCH="$target_karch" CROSS_COMPILE="$target_cross" CC="$EXP_CC_BIN" modules_prepare; then
+                kmod_log_warn "Skipping target '$git_channel_name:$kernel_flavor_version': modules_prepare failed"
+                kmod_log_external_output_excerpt "modules_prepare ($git_channel_name:$kernel_flavor_version)" "$MODULES_PREP_LOG_FILE" 220
+                SKIP_COUNT=$((SKIP_COUNT + 1))
+                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$git_channel_name:$kernel_flavor_version(modules-prepare-failed)"
+                kmod_log_section_end
+                continue
+              fi
+
+              touch "$PREP_STAMP"
+            fi
+
+            CC_BIN="$(kmod_resolve_compiler_bin "$target_cross")"
+            if [ -z "$CC_BIN" ] || ! command -v "$CC_BIN" >/dev/null 2>&1; then
+              kmod_log_warn "Skipping target '$git_channel_name:$kernel_flavor_version': compiler not found ('$CC_BIN')"
+              SKIP_COUNT=$((SKIP_COUNT + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$git_channel_name:$kernel_flavor_version(compiler-missing)"
+              kmod_log_section_end
+              continue
+            fi
+
+            sudo mkdir -p "/lib/modules/$kernel_flavor_version"
+            sudo rm -rf "/lib/modules/$kernel_flavor_version/build"
+            sudo ln -s "$SRC_DIR" "/lib/modules/$kernel_flavor_version/build"
+
+            export ARCH="$target_karch"
+            export CROSS_COMPILE="$target_cross"
+            export CC="$CC_BIN"
+            export KVER="$kernel_flavor_version"
+
+            make CC="$CC_BIN" clean || true
+            MAKE_LOG_FILE="$RUNNER_TEMP/git-make-${git_channel_name}-${kernel_flavor_version}.log"
+            rm -f "$MAKE_LOG_FILE"
+
+            if kmod_run_command_capture_with_label "make CC=$CC_BIN (target=$git_channel_name:$kernel_flavor_version)" "$MAKE_LOG_FILE" make CC="$CC_BIN"; then
+              KO_COUNT="$(find . -maxdepth 1 -type f -name '*.ko' | wc -l | tr -d ' ')"
+              DTBO_COUNT="$(find . -maxdepth 1 -type f -name '*.dtbo' | wc -l | tr -d ' ')"
+
+              if [ "$KO_COUNT" -eq 0 ] || [ "$DTBO_COUNT" -eq 0 ]; then
+                kmod_log_error "Target '$git_channel_name:$kernel_flavor_version' failed: expected .ko and .dtbo outputs are required"
+                FAIL=1
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$git_channel_name:$kernel_flavor_version(artifact-contract-failed)"
+              else
+                OUT_DIR="$ARTIFACT_ROOT/$git_channel_name/$target_apt_arch/module-artifacts-$kernel_flavor_version"
+                mkdir -p "$OUT_DIR"
+                find . -maxdepth 1 -type f -name '*.ko' -exec cp -v {} "$OUT_DIR/" \;
+                find . -maxdepth 1 -type f -name '*.dtbo' -exec cp -v {} "$OUT_DIR/" \;
+                OK_COUNT=$((OK_COUNT + 1))
+                OK_KERNELS="${OK_KERNELS:+$OK_KERNELS,}$git_channel_name:$kernel_flavor_version"
+                kmod_log_info "Target '$git_channel_name:$kernel_flavor_version' build succeeded"
+              fi
+            else
+              kmod_log_error "Target '$git_channel_name:$kernel_flavor_version' failed: make returned non-zero"
+              if [ -f "$MAKE_LOG_FILE" ]; then
+                kmod_log_external_output_excerpt "make CC=$CC_BIN ($git_channel_name:$kernel_flavor_version)" "$MAKE_LOG_FILE" 220
+                ERR_SNIPPET="$(kmod_extract_make_error_snippet "$MAKE_LOG_FILE")"
+                if [ -n "$ERR_SNIPPET" ]; then
+                  ERR_ANNOTATION="$(printf '%s' "$ERR_SNIPPET" | kmod_escape_annotation)"
+                  echo "::error::Target '$git_channel_name:$kernel_flavor_version' relevant error:%0A$ERR_ANNOTATION"
+                fi
+              fi
+              FAIL=1
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$git_channel_name:$kernel_flavor_version(make-failed)"
+            fi
+
+            kmod_log_section_end
+          done < "$TARGET_FILE"
+
+          kmod_log_section_begin "Git resolver summary"
+          kmod_log_info "Summary: targets=$TARGET_COUNT ok=$OK_COUNT skip=$SKIP_COUNT fail=$FAIL_COUNT"
+          [ -n "$SKIP_KERNELS" ] && kmod_log_warn "Skipped targets: $SKIP_KERNELS"
+          [ -n "$FAIL_KERNELS" ] && kmod_log_error "Failed targets: $FAIL_KERNELS"
+          kmod_log_section_end
+
+          if [ "$TARGET_COUNT" -eq 0 ]; then
+            kmod_fail "No git targets were processed"
+            exit 1
+          fi
+
+          if [ "$FAIL_ON_SKIP" = "true" ] && [ "$SKIP_COUNT" -gt 0 ]; then
+            kmod_log_error "Skipping targets is configured as blocking and $SKIP_COUNT target(s) were skipped"
+            FAIL=1
+          fi
+
+          echo "target_count=$TARGET_COUNT" >> "$GITHUB_OUTPUT"
+          echo "ok_count=$OK_COUNT" >> "$GITHUB_OUTPUT"
+          echo "skip_count=$SKIP_COUNT" >> "$GITHUB_OUTPUT"
+          echo "fail_count=$FAIL_COUNT" >> "$GITHUB_OUTPUT"
+          echo "ok_kernels=$OK_KERNELS" >> "$GITHUB_OUTPUT"
+          echo "skip_kernels=$SKIP_KERNELS" >> "$GITHUB_OUTPUT"
+          echo "fail_kernels=$FAIL_KERNELS" >> "$GITHUB_OUTPUT"
+
+          exit "$FAIL"
+
+      - name: Upload artifacts
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/upload-artifact@v6
+        with:
+          name: kmod-artifacts-git
+          path: ${{ runner.temp }}/kmod-artifacts/git/
+
+      - name: Show final status
+        if: always()
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+          TARGETS="${{ steps.build.outputs.target_count }}"
+          OKS="${{ steps.build.outputs.ok_count }}"
+          SKIPS="${{ steps.build.outputs.skip_count }}"
+          FAILS="${{ steps.build.outputs.fail_count }}"
+          [ -z "$TARGETS" ] && TARGETS=0
+          [ -z "$OKS" ] && OKS=0
+          [ -z "$SKIPS" ] && SKIPS=0
+          [ -z "$FAILS" ] && FAILS=0
+
+          if [ "${{ steps.build.outcome }}" = "failure" ]; then
+            kmod_log_error "FAIL: git resolver build step failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
+            exit 1
+          fi
+
+          if [ "$FAILS" -gt 0 ]; then
+            kmod_log_error "FAIL: one or more git targets failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
+            exit 1
+          fi
+
+          if [ "${{ inputs.fail_on_skip }}" = "true" ] && [ "$SKIPS" -gt 0 ]; then
+            kmod_log_error "FAIL: skip targets are blocking and skip_count=$SKIPS"
+            exit 1
+          fi
+
+          if [ "$OKS" -gt 0 ]; then
+            kmod_log_info "OK: git resolver completed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
+          else
+            kmod_log_error "FAIL: git resolver produced no successful targets"
+            exit 1
+          fi

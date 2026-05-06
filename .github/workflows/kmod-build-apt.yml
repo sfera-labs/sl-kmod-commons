@@ -1,0 +1,617 @@
+name: Kernel Module Build (apt resolver)
+
+on:
+  workflow_call:
+    inputs:
+      module_path:
+        required: false
+        type: string
+        default: '.'
+      apt_sources:
+        required: false
+        type: string
+        default: 'rpi-archive'
+      kernel_versions:
+        required: false
+        type: string
+        default: ''
+      fail_on_skip:
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout module repo
+        uses: actions/checkout@v5
+
+      - name: Checkout CI utilities repo
+        # Assumption: reusable workflows are consumed from sl-kmod-commons main branch.
+        uses: actions/checkout@v5
+        with:
+          repository: sfera-labs/sl-kmod-commons
+          ref: main
+          path: .kmod-ci-commons
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+          kmod_log_section_begin "Install dependencies"
+          kmod_log_info "Runner host architecture: $(dpkg --print-architecture)"
+          sudo apt update
+          sudo apt install -y build-essential jq curl xz-utils gnupg gcc-12 gcc-14 device-tree-compiler
+          sudo apt install -y gcc-12-arm-linux-gnueabihf gcc-14-arm-linux-gnueabihf
+
+          if ! command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
+            if command -v arm-linux-gnueabihf-gcc-14 >/dev/null 2>&1; then
+              sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-14)" /usr/local/bin/arm-linux-gnueabihf-gcc
+            elif command -v arm-linux-gnueabihf-gcc-12 >/dev/null 2>&1; then
+              sudo ln -sf "$(command -v arm-linux-gnueabihf-gcc-12)" /usr/local/bin/arm-linux-gnueabihf-gcc
+            fi
+          fi
+          kmod_log_section_end
+
+      - name: Enable apt architectures
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+          kmod_log_section_begin "Enable apt architectures"
+          sudo dpkg --add-architecture arm64
+          sudo dpkg --add-architecture armhf
+          sudo apt-get update --allow-releaseinfo-change || true
+          sudo apt-get install -y libc6:armhf libstdc++6:armhf
+          kmod_log_section_end
+
+      - name: Configure apt sources
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+          APT_SOURCES_RAW="${{ inputs.apt_sources }}"
+          INCLUDE_RPI_ARCHIVE=0
+          INCLUDE_UBUNTU_ARCHIVE=0
+
+          while IFS= read -r source_name; do
+            [ -z "$source_name" ] && continue
+            case "$source_name" in
+              rpi-archive)
+                INCLUDE_RPI_ARCHIVE=1
+                ;;
+              ubuntu-archive)
+                INCLUDE_UBUNTU_ARCHIVE=1
+                ;;
+              *)
+                kmod_log_warn "Ignoring invalid apt source '$source_name'"
+                ;;
+            esac
+          done < <(kmod_parse_csv_tokens "$APT_SOURCES_RAW" true)
+
+          if [ "$INCLUDE_RPI_ARCHIVE" -eq 0 ] && [ "$INCLUDE_UBUNTU_ARCHIVE" -eq 0 ]; then
+            kmod_fail "No valid apt sources were configured; valid values are rpi-archive, ubuntu-archive"
+            exit 1
+          fi
+
+          kmod_log_section_begin "Configure apt sources"
+          kmod_log_info "Resolved apt sources: rpi-archive=$INCLUDE_RPI_ARCHIVE ubuntu-archive=$INCLUDE_UBUNTU_ARCHIVE"
+
+          if [ "$INCLUDE_RPI_ARCHIVE" -eq 1 ]; then
+            DISTRO_INFO_URL="https://salsa.debian.org/debian/distro-info-data/-/raw/main/debian.csv"
+            TODAY="$(date -u +%F)"
+
+            repo_suite_exists() {
+              local suite_name="$1"
+              curl -fsSI "http://archive.raspberrypi.org/debian/dists/$suite_name/InRelease" >/dev/null \
+                || curl -fsSI "http://archive.raspberrypi.org/debian/dists/$suite_name/Release" >/dev/null
+            }
+
+            DISTRO_INFO="$(curl -fsSL "$DISTRO_INFO_URL" || true)"
+            STABLE_SUITE=""
+            OLDSTABLE_SUITE=""
+            NEXT_SUITE=""
+
+            if [ -n "$DISTRO_INFO" ]; then
+              STABLE_SUITE="$(printf '%s\n' "$DISTRO_INFO" | awk -F',' -v today="$TODAY" 'NR > 1 && $5 != "" && $5 <= today { if ($5 > max) { max=$5; code=tolower($2) } } END { print code }')"
+              OLDSTABLE_SUITE="$(printf '%s\n' "$DISTRO_INFO" | awk -F',' -v today="$TODAY" 'NR > 1 && $5 != "" && $5 <= today { print $5 "," tolower($2) }' | sort -t',' -k1,1 | tail -n2 | head -n1 | cut -d',' -f2)"
+              NEXT_SUITE="$(printf '%s\n' "$DISTRO_INFO" | awk -F',' -v today="$TODAY" 'NR > 1 && $5 != "" && $5 > today { if (min == "" || $5 < min) { min=$5; code=tolower($2) } } END { print code }')"
+            fi
+
+            if [ -z "$STABLE_SUITE" ]; then
+              STABLE_SUITE="trixie"
+              kmod_log_warn "Failed to resolve stable suite from distro-info; falling back to '$STABLE_SUITE'"
+            fi
+
+            CANDIDATE_SUITES_RAW="$STABLE_SUITE $OLDSTABLE_SUITE $NEXT_SUITE"
+            ENABLED_SUITES=""
+            SEEN_SUITES=" "
+            for suite_name in $CANDIDATE_SUITES_RAW; do
+              suite_name="$(echo "$suite_name" | xargs | tr '[:upper:]' '[:lower:]')"
+              [ -z "$suite_name" ] && continue
+
+              case " $SEEN_SUITES " in
+                *" $suite_name "*)
+                  continue
+                  ;;
+              esac
+              SEEN_SUITES="$SEEN_SUITES$suite_name "
+
+              if repo_suite_exists "$suite_name"; then
+                ENABLED_SUITES="${ENABLED_SUITES:+$ENABLED_SUITES }$suite_name"
+              else
+                kmod_log_warn "Skipping unavailable Raspberry Pi suite '$suite_name'"
+              fi
+            done
+
+            if [ -z "$ENABLED_SUITES" ]; then
+              kmod_fail "No usable Raspberry Pi repository suites were found"
+              exit 1
+            fi
+
+            : | sudo tee /etc/apt/sources.list.d/raspi.list >/dev/null
+            for suite_name in $ENABLED_SUITES; do
+              echo "deb http://archive.raspberrypi.org/debian/ $suite_name main" | sudo tee -a /etc/apt/sources.list.d/raspi.list >/dev/null
+            done
+            curl -fsSL https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/raspberrypi.gpg
+          fi
+
+          sudo apt-get update --allow-releaseinfo-change
+          kmod_log_section_end
+
+      - name: Discover apt targets
+        id: discover
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+          APT_SOURCES_RAW="${{ inputs.apt_sources }}"
+          KERNEL_VERSIONS_RAW="${{ inputs.kernel_versions }}"
+
+          INCLUDE_RPI_ARCHIVE=0
+          INCLUDE_UBUNTU_ARCHIVE=0
+          while IFS= read -r source_name; do
+            [ -z "$source_name" ] && continue
+            case "$source_name" in
+              rpi-archive) INCLUDE_RPI_ARCHIVE=1 ;;
+              ubuntu-archive) INCLUDE_UBUNTU_ARCHIVE=1 ;;
+            esac
+          done < <(kmod_parse_csv_tokens "$APT_SOURCES_RAW" true)
+
+          CANDIDATE_FILE="$GITHUB_WORKSPACE/apt-candidates.txt"
+          SELECTED_FILE="$GITHUB_WORKSPACE/apt-targets.txt"
+          APT_LIST_OUTPUT_FILE="$RUNNER_TEMP/apt-list-linux-headers.log"
+          rm -f "$CANDIDATE_FILE" "$SELECTED_FILE"
+
+          kmod_log_section_begin "Discover apt candidates"
+          if ! kmod_run_command_capture_with_label "apt list -a linux-headers-*" "$APT_LIST_OUTPUT_FILE" apt list -a 'linux-headers-*'; then
+            kmod_log_external_output_excerpt "apt list -a linux-headers-*" "$APT_LIST_OUTPUT_FILE" 200
+            kmod_fail "Failed to query apt package metadata"
+            exit 1
+          fi
+
+          awk -v include_rpi="$INCLUDE_RPI_ARCHIVE" -v include_ubuntu="$INCLUDE_UBUNTU_ARCHIVE" '
+            /^linux-headers-[0-9]/ {
+              split($1, path, "/")
+              pkg=path[1]
+              sub(/^linux-headers-/, "", pkg)
+              arch=$3
+              if (arch !~ /^(arm64|armhf)$/) next
+              if (pkg !~ /^[0-9]+\.[0-9]+\.[0-9]+/) next
+
+              source_name=""
+              if (pkg ~ /\+rpt-/) {
+                source_name="rpi-archive"
+              } else if (pkg ~ /-raspi$/) {
+                source_name="ubuntu-archive"
+              } else {
+                next
+              }
+
+              if (source_name == "rpi-archive" && include_rpi != 1) next
+              if (source_name == "ubuntu-archive" && include_ubuntu != 1) next
+
+              if (source_name == "ubuntu-archive") {
+                if (match(pkg, /^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+/)) {
+                  core=substr(pkg, RSTART, RLENGTH)
+                } else if (match(pkg, /^[0-9]+\.[0-9]+\.[0-9]+/)) {
+                  core=substr(pkg, RSTART, RLENGTH)
+                } else {
+                  next
+                }
+              } else {
+                if (match(pkg, /^[0-9]+\.[0-9]+\.[0-9]+/)) {
+                  core=substr(pkg, RSTART, RLENGTH)
+                } else {
+                  next
+                }
+              }
+
+              if (match(core, /^[0-9]+\.[0-9]+/)) {
+                line=substr(core, RSTART, RLENGTH)
+              } else {
+                next
+              }
+
+              print pkg "|" arch "|linux-headers-" pkg "|" source_name "|" core "|" line
+            }
+          ' "$APT_LIST_OUTPUT_FILE" | sort -u > "$CANDIDATE_FILE"
+
+          if [ ! -s "$CANDIDATE_FILE" ]; then
+            kmod_log_external_output_excerpt "apt list -a linux-headers-*" "$APT_LIST_OUTPUT_FILE" 120
+            kmod_fail "Discovery produced no apt candidates"
+            exit 1
+          fi
+
+          add_targets_for_core() {
+            local kernel_core_version="$1"
+            [ -z "$kernel_core_version" ] && return 0
+            awk -F'|' -v c="$kernel_core_version" '$5 == c { print }' "$CANDIDATE_FILE" >> "$SELECTED_FILE"
+          }
+
+          : > "$SELECTED_FILE"
+
+          if [ -n "$KERNEL_VERSIONS_RAW" ]; then
+            kmod_log_info "Selector mode: explicit"
+            while IFS= read -r version_token; do
+              [ -z "$version_token" ] && continue
+              if echo "$version_token" | grep -Eq '[+-]'; then
+                awk -F'|' -v t="$version_token" '$1 == t { print }' "$CANDIDATE_FILE" >> "$SELECTED_FILE"
+              elif echo "$version_token" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                add_targets_for_core "$version_token"
+              else
+                kmod_log_warn "Ignoring invalid kernel_versions token '$version_token'"
+              fi
+            done < <(kmod_parse_csv_tokens "$KERNEL_VERSIONS_RAW" false)
+          else
+            kmod_log_info "Selector mode: auto"
+            awk -F'|' '{ print $6 }' "$CANDIDATE_FILE" | sort -uV | while IFS= read -r line_value; do
+              [ -z "$line_value" ] && continue
+              latest_core="$(awk -F'|' -v l="$line_value" '$6 == l { print $5 }' "$CANDIDATE_FILE" | sort -uV | tail -n 1 || true)"
+              add_targets_for_core "$latest_core"
+            done
+          fi
+
+          sort -u "$SELECTED_FILE" -o "$SELECTED_FILE"
+
+          if [ ! -s "$SELECTED_FILE" ]; then
+            kmod_fail "Selector produced no apt targets"
+            exit 1
+          fi
+
+          TARGET_COUNT="$(wc -l < "$SELECTED_FILE" | tr -d ' ')"
+          [ -z "$TARGET_COUNT" ] && TARGET_COUNT=0
+
+          kmod_log_info "Discovered apt targets: $TARGET_COUNT"
+          cat "$SELECTED_FILE"
+          kmod_log_section_end
+
+          echo "target_count=$TARGET_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Build against apt targets
+        id: build
+        working-directory: ${{ inputs.module_path }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+          TARGET_FILE="$GITHUB_WORKSPACE/apt-targets.txt"
+          HOST_ARCH="$(dpkg --print-architecture)"
+          DOWNLOAD_DIR="$RUNNER_TEMP/apt-kernel-debs"
+          ARTIFACT_ROOT="$RUNNER_TEMP/kmod-artifacts/apt"
+          FAIL_ON_SKIP="${{ inputs.fail_on_skip }}"
+
+          OK_COUNT=0
+          FAIL_COUNT=0
+          SKIP_COUNT=0
+          TARGET_COUNT=0
+          OK_KERNELS=""
+          FAIL_KERNELS=""
+          SKIP_KERNELS=""
+          FAIL=0
+          APT_DOWNLOAD_OUTPUT_FILE="$RUNNER_TEMP/apt-download-command.log"
+
+          apt_target_package_download() {
+            local apt_target_package_spec="$1"
+
+            # Keep this helper centralized so all apt download failures have the same diagnostics shape.
+            if (cd "$DOWNLOAD_DIR" && apt download "$apt_target_package_spec" >"$APT_DOWNLOAD_OUTPUT_FILE" 2>&1); then
+              return 0
+            fi
+
+            kmod_log_external_output_excerpt "apt download $apt_target_package_spec" "$APT_DOWNLOAD_OUTPUT_FILE" 120
+            return 1
+          }
+
+          rm -rf "$DOWNLOAD_DIR" "$ARTIFACT_ROOT"
+          mkdir -p "$DOWNLOAD_DIR" "$ARTIFACT_ROOT"
+
+          if [ ! -s "$TARGET_FILE" ]; then
+            kmod_fail "Target file is missing or empty before build"
+            exit 1
+          fi
+
+          while IFS='|' read -r KERNEL_VERSION TARGET_APT_ARCH HEADER_PACKAGE APT_SOURCE_NAME KERNEL_CORE_VERSION KERNEL_LINE_VALUE; do
+            [ -z "$KERNEL_VERSION" ] && continue
+            TARGET_COUNT=$((TARGET_COUNT + 1))
+
+            kmod_log_section_begin "Build target $KERNEL_VERSION"
+            kmod_log_info "Target metadata: arch=$TARGET_APT_ARCH source=$APT_SOURCE_NAME core=$KERNEL_CORE_VERSION line=$KERNEL_LINE_VALUE"
+
+            rm -f "$DOWNLOAD_DIR"/*.deb 2>/dev/null || true
+
+            if ! apt_target_package_download "$HEADER_PACKAGE:$TARGET_APT_ARCH"; then
+              kmod_log_warn "Skipping kernel '$KERNEL_VERSION': cannot download headers package '$HEADER_PACKAGE:$TARGET_APT_ARCH'"
+              SKIP_COUNT=$((SKIP_COUNT + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(missing-headers-package)"
+              kmod_log_section_end
+              continue
+            fi
+
+            COMMON_PACKAGE=""
+            KBUILD_PACKAGE=""
+            if [ "$APT_SOURCE_NAME" = "rpi-archive" ]; then
+              BASE_RPT="$(echo "$KERNEL_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\+rpt' || true)"
+              if [ -z "$BASE_RPT" ]; then
+                kmod_log_warn "Skipping kernel '$KERNEL_VERSION': failed to derive +rpt base"
+                SKIP_COUNT=$((SKIP_COUNT + 1))
+                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(derive-rpt-base-failed)"
+                kmod_log_section_end
+                continue
+              fi
+              COMMON_PACKAGE="linux-headers-${BASE_RPT}-common-rpi"
+              KBUILD_PACKAGE="linux-kbuild-${BASE_RPT}"
+
+              if ! apt_target_package_download "$COMMON_PACKAGE:$TARGET_APT_ARCH" \
+                && ! apt_target_package_download "$COMMON_PACKAGE"; then
+                kmod_log_warn "Skipping kernel '$KERNEL_VERSION': cannot download common headers package '$COMMON_PACKAGE'"
+                SKIP_COUNT=$((SKIP_COUNT + 1))
+                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(missing-common-headers-package)"
+                kmod_log_section_end
+                continue
+              fi
+            else
+              KBUILD_PACKAGE="linux-kbuild-${KERNEL_LINE_VALUE}"
+            fi
+
+            KBUILD_OK=0
+            if [ "$TARGET_APT_ARCH" = "armhf" ] && [ "$HOST_ARCH" = "arm64" ]; then
+              if apt_target_package_download "$KBUILD_PACKAGE:armhf" \
+                || apt_target_package_download "$KBUILD_PACKAGE:$HOST_ARCH"; then
+                KBUILD_OK=1
+              fi
+            else
+              if apt_target_package_download "$KBUILD_PACKAGE:$HOST_ARCH"; then
+                KBUILD_OK=1
+              fi
+            fi
+            if [ "$KBUILD_OK" -ne 1 ] && apt_target_package_download "$KBUILD_PACKAGE"; then
+              KBUILD_OK=1
+            fi
+            if [ "$KBUILD_OK" -ne 1 ]; then
+              kmod_log_warn "Skipping kernel '$KERNEL_VERSION': cannot download kbuild package '$KBUILD_PACKAGE'"
+              SKIP_COUNT=$((SKIP_COUNT + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(missing-kbuild-package)"
+              kmod_log_section_end
+              continue
+            fi
+
+            HEADERS_DEB="$(ls "$DOWNLOAD_DIR"/${HEADER_PACKAGE}_*.deb | grep -E "_${TARGET_APT_ARCH}\\.deb$" | head -n1 || true)"
+            COMMON_DEB=""
+            if [ -n "$COMMON_PACKAGE" ]; then
+              COMMON_DEB="$(ls "$DOWNLOAD_DIR"/${COMMON_PACKAGE}_*.deb | grep -E "_(${TARGET_APT_ARCH}|all)\\.deb$" | head -n1 || true)"
+            fi
+
+            KBUILD_DEB=""
+            if [ "$TARGET_APT_ARCH" = "armhf" ] && [ "$HOST_ARCH" = "arm64" ]; then
+              for kbuild_arch in armhf "$HOST_ARCH" all; do
+                KBUILD_DEB="$(ls "$DOWNLOAD_DIR"/${KBUILD_PACKAGE}_*.deb | grep -E "_${kbuild_arch}\\.deb$" | head -n1 || true)"
+                [ -n "$KBUILD_DEB" ] && break
+              done
+            else
+              KBUILD_DEB="$(ls "$DOWNLOAD_DIR"/${KBUILD_PACKAGE}_*.deb | grep -E "_(${HOST_ARCH}|all)\\.deb$" | head -n1 || true)"
+            fi
+
+            if [ -z "$HEADERS_DEB" ] || [ -z "$KBUILD_DEB" ] || { [ -n "$COMMON_PACKAGE" ] && [ -z "$COMMON_DEB" ]; }; then
+              kmod_log_warn "Skipping kernel '$KERNEL_VERSION': downloaded files could not be resolved"
+              SKIP_COUNT=$((SKIP_COUNT + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(downloaded-file-resolution-failed)"
+              kmod_log_section_end
+              continue
+            fi
+
+            rm -rf root
+            mkdir root
+            if ! dpkg-deb -x "$HEADERS_DEB" root/; then
+              kmod_log_warn "Skipping kernel '$KERNEL_VERSION': failed to extract headers"
+              SKIP_COUNT=$((SKIP_COUNT + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(headers-extract-failed)"
+              kmod_log_section_end
+              continue
+            fi
+            if [ -n "$COMMON_DEB" ] && ! dpkg-deb -x "$COMMON_DEB" root/; then
+              kmod_log_warn "Skipping kernel '$KERNEL_VERSION': failed to extract common headers"
+              SKIP_COUNT=$((SKIP_COUNT + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(common-extract-failed)"
+              kmod_log_section_end
+              continue
+            fi
+            if ! dpkg-deb -x "$KBUILD_DEB" root/; then
+              kmod_log_warn "Skipping kernel '$KERNEL_VERSION': failed to extract kbuild package"
+              SKIP_COUNT=$((SKIP_COUNT + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(kbuild-extract-failed)"
+              kmod_log_section_end
+              continue
+            fi
+
+            case "$TARGET_APT_ARCH" in
+              arm64)
+                if [ "$HOST_ARCH" = "arm64" ]; then
+                  CROSS_COMPILE=""
+                else
+                  CROSS_COMPILE="aarch64-linux-gnu-"
+                fi
+                KARCH="arm64"
+                ;;
+              armhf)
+                CROSS_COMPILE="arm-linux-gnueabihf-"
+                KARCH="arm"
+                ;;
+              *)
+                kmod_log_warn "Skipping kernel '$KERNEL_VERSION': unsupported target architecture '$TARGET_APT_ARCH'"
+                SKIP_COUNT=$((SKIP_COUNT + 1))
+                SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(unsupported-target-arch)"
+                kmod_log_section_end
+                continue
+                ;;
+            esac
+
+            HEADER_DIR_NAME=""
+            if [ -d "root/usr/src/$HEADER_PACKAGE" ]; then
+              HEADER_DIR_NAME="$HEADER_PACKAGE"
+            else
+              HEADER_DIR_NAME="$(ls root/usr/src | grep "linux-headers-$KERNEL_VERSION" | head -n1 || true)"
+            fi
+
+            if [ -z "$HEADER_DIR_NAME" ]; then
+              kmod_log_warn "Skipping kernel '$KERNEL_VERSION': header directory not found after extraction"
+              SKIP_COUNT=$((SKIP_COUNT + 1))
+              SKIP_KERNELS="${SKIP_KERNELS:+$SKIP_KERNELS,}$KERNEL_VERSION(header-dir-missing)"
+              kmod_log_section_end
+              continue
+            fi
+
+            KDIR_PATH="$GITHUB_WORKSPACE/root/usr/src/$HEADER_DIR_NAME"
+            sudo rm -rf /usr/src
+            sudo ln -s "$GITHUB_WORKSPACE/root/usr/src" /usr/src
+            sudo mkdir -p "/lib/modules/$KERNEL_VERSION"
+            sudo rm -rf "/lib/modules/$KERNEL_VERSION/build"
+            sudo ln -s "$KDIR_PATH" "/lib/modules/$KERNEL_VERSION/build"
+
+            CC_BIN="$(kmod_resolve_compiler_bin "$CROSS_COMPILE")"
+            if [ -z "$CC_BIN" ] || ! command -v "$CC_BIN" >/dev/null 2>&1; then
+              kmod_log_error "Kernel '$KERNEL_VERSION' failed: compiler not found ('$CC_BIN')"
+              FAIL=1
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KERNEL_VERSION(compiler-missing)"
+              kmod_log_section_end
+              continue
+            fi
+
+            export ARCH="$KARCH"
+            export CROSS_COMPILE="$CROSS_COMPILE"
+            export CC="$CC_BIN"
+            export KVER="$KERNEL_VERSION"
+
+            make CC="$CC_BIN" clean || true
+            MAKE_LOG_FILE="$RUNNER_TEMP/apt-make-${KERNEL_VERSION}.log"
+            rm -f "$MAKE_LOG_FILE"
+
+            if kmod_run_command_capture_with_label "make CC=$CC_BIN (kernel=$KERNEL_VERSION)" "$MAKE_LOG_FILE" make CC="$CC_BIN"; then
+              KO_COUNT="$(find . -maxdepth 1 -type f -name '*.ko' | wc -l | tr -d ' ')"
+              DTBO_COUNT="$(find . -maxdepth 1 -type f -name '*.dtbo' | wc -l | tr -d ' ')"
+
+              if [ "$KO_COUNT" -eq 0 ] || [ "$DTBO_COUNT" -eq 0 ]; then
+                kmod_log_error "Kernel '$KERNEL_VERSION' failed: expected .ko and .dtbo outputs are required"
+                FAIL=1
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KERNEL_VERSION(artifact-contract-failed)"
+              else
+                OUT_DIR="$ARTIFACT_ROOT/$TARGET_APT_ARCH/module-artifacts-$KERNEL_VERSION"
+                mkdir -p "$OUT_DIR"
+                find . -maxdepth 1 -type f -name '*.ko' -exec cp -v {} "$OUT_DIR/" \;
+                find . -maxdepth 1 -type f -name '*.dtbo' -exec cp -v {} "$OUT_DIR/" \;
+                OK_COUNT=$((OK_COUNT + 1))
+                OK_KERNELS="${OK_KERNELS:+$OK_KERNELS,}$KERNEL_VERSION"
+                kmod_log_info "Kernel '$KERNEL_VERSION' build succeeded"
+              fi
+            else
+              kmod_log_error "Kernel '$KERNEL_VERSION' failed: make returned non-zero"
+              if [ -f "$MAKE_LOG_FILE" ]; then
+                kmod_log_external_output_excerpt "make CC=$CC_BIN" "$MAKE_LOG_FILE" 220
+                ERR_SNIPPET="$(kmod_extract_make_error_snippet "$MAKE_LOG_FILE")"
+                if [ -n "$ERR_SNIPPET" ]; then
+                  ERR_ANNOTATION="$(printf '%s' "$ERR_SNIPPET" | kmod_escape_annotation)"
+                  echo "::error::Kernel '$KERNEL_VERSION' relevant error:%0A$ERR_ANNOTATION"
+                fi
+              fi
+              FAIL=1
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              FAIL_KERNELS="${FAIL_KERNELS:+$FAIL_KERNELS,}$KERNEL_VERSION(make-failed)"
+            fi
+
+            kmod_log_section_end
+          done < "$TARGET_FILE"
+
+          kmod_log_section_begin "Apt resolver summary"
+          kmod_log_info "Summary: targets=$TARGET_COUNT ok=$OK_COUNT skip=$SKIP_COUNT fail=$FAIL_COUNT"
+          [ -n "$SKIP_KERNELS" ] && kmod_log_warn "Skipped targets: $SKIP_KERNELS"
+          [ -n "$FAIL_KERNELS" ] && kmod_log_error "Failed targets: $FAIL_KERNELS"
+          kmod_log_section_end
+
+          if [ "$TARGET_COUNT" -eq 0 ]; then
+            kmod_fail "No apt targets were processed"
+            exit 1
+          fi
+
+          if [ "$FAIL_ON_SKIP" = "true" ] && [ "$SKIP_COUNT" -gt 0 ]; then
+            kmod_log_error "Skipping targets is configured as blocking and $SKIP_COUNT target(s) were skipped"
+            FAIL=1
+          fi
+
+          echo "target_count=$TARGET_COUNT" >> "$GITHUB_OUTPUT"
+          echo "ok_count=$OK_COUNT" >> "$GITHUB_OUTPUT"
+          echo "skip_count=$SKIP_COUNT" >> "$GITHUB_OUTPUT"
+          echo "fail_count=$FAIL_COUNT" >> "$GITHUB_OUTPUT"
+          echo "ok_kernels=$OK_KERNELS" >> "$GITHUB_OUTPUT"
+          echo "skip_kernels=$SKIP_KERNELS" >> "$GITHUB_OUTPUT"
+          echo "fail_kernels=$FAIL_KERNELS" >> "$GITHUB_OUTPUT"
+
+          exit "$FAIL"
+
+      - name: Upload artifacts
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/upload-artifact@v6
+        with:
+          name: kmod-artifacts-apt
+          path: ${{ runner.temp }}/kmod-artifacts/apt/
+
+      - name: Show final status
+        if: always()
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+          TARGETS="${{ steps.build.outputs.target_count }}"
+          OKS="${{ steps.build.outputs.ok_count }}"
+          SKIPS="${{ steps.build.outputs.skip_count }}"
+          FAILS="${{ steps.build.outputs.fail_count }}"
+          [ -z "$TARGETS" ] && TARGETS=0
+          [ -z "$OKS" ] && OKS=0
+          [ -z "$SKIPS" ] && SKIPS=0
+          [ -z "$FAILS" ] && FAILS=0
+
+          if [ "${{ steps.build.outcome }}" = "failure" ]; then
+            kmod_log_error "FAIL: apt resolver build step failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
+            exit 1
+          fi
+
+          if [ "$FAILS" -gt 0 ]; then
+            kmod_log_error "FAIL: one or more apt targets failed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
+            exit 1
+          fi
+
+          if [ "${{ inputs.fail_on_skip }}" = "true" ] && [ "$SKIPS" -gt 0 ]; then
+            kmod_log_error "FAIL: skip targets are blocking and skip_count=$SKIPS"
+            exit 1
+          fi
+
+          if [ "$OKS" -gt 0 ]; then
+            kmod_log_info "OK: apt resolver completed (targets=$TARGETS ok=$OKS skip=$SKIPS fail=$FAILS)"
+          else
+            kmod_log_error "FAIL: apt resolver produced no successful targets"
+            exit 1
+          fi
