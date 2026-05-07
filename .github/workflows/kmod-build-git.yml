@@ -195,9 +195,7 @@ jobs:
           kmod_log_section_end
 
           echo "target_count=$TARGET_COUNT" >> "$GITHUB_OUTPUT"
-          kmod_emit_requested_resolved_outputs "$REQUESTED_SOURCES" "$RESOLVED_SOURCES" "$REQUESTED_STREAMS" "$RESOLVED_STREAM_LIST"
-          echo "resolved_core_list=$RESOLVED_CORE_LIST" >> "$GITHUB_OUTPUT"
-          echo "resolved_flavor_list=$RESOLVED_FLAVOR_LIST" >> "$GITHUB_OUTPUT"
+          kmod_emit_resolver_scope_outputs "$REQUESTED_SOURCES" "$RESOLVED_SOURCES" "$REQUESTED_STREAMS" "$RESOLVED_STREAM_LIST" "$RESOLVED_CORE_LIST" "$RESOLVED_FLAVOR_LIST"
 
       - name: Build against git targets
         id: build
@@ -311,7 +309,7 @@ jobs:
             fi
             MAKE_LOG_FILE="$RUNNER_TEMP/git-make-${git_stream_name}-${kernel_flavor_version}.log"
 
-            kmod_build_target_with_make \
+            KBUILD_MODPOST_WARN=1 kmod_build_target_with_make \
               "Target" \
               "$TARGET_KEY" \
               "$TARGET_KEY" \
@@ -342,10 +340,10 @@ jobs:
           set -euo pipefail
           source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
 
-          REQUESTED_SOURCES="${{ steps.discover.outputs.requested_source_list }}"
-          RESOLVED_SOURCES="${{ steps.discover.outputs.resolved_source_list }}"
-          REQUESTED_STREAMS="${{ steps.discover.outputs.requested_stream_list }}"
-          RESOLVED_STREAMS="${{ steps.discover.outputs.resolved_stream_list }}"
+          REQUESTED_SOURCES="$(kmod_first_non_empty "${{ steps.discover.outputs.requested_source_list }}" "${{ inputs.sources }}")"
+          RESOLVED_SOURCES="$(kmod_first_non_empty "${{ steps.discover.outputs.resolved_source_list }}" "${{ inputs.sources }}")"
+          REQUESTED_STREAMS="$(kmod_first_non_empty "${{ steps.discover.outputs.requested_stream_list }}" "${{ inputs.streams }}")"
+          RESOLVED_STREAMS="$(kmod_first_non_empty "${{ steps.discover.outputs.resolved_stream_list }}")"
           RESOLVED_CORES="${{ steps.discover.outputs.resolved_core_list }}"
           RESOLVED_FLAVORS="${{ steps.discover.outputs.resolved_flavor_list }}"
           TARGETS="${{ steps.build.outputs.target_count }}"

@@ -256,6 +256,32 @@ kmod_emit_requested_resolved_outputs() {
   echo "resolved_stream_list=$resolved_streams" >> "$GITHUB_OUTPUT"
 }
 
+kmod_emit_resolver_scope_outputs() {
+  local requested_sources="$1"
+  local resolved_sources="$2"
+  local requested_streams="$3"
+  local resolved_streams="$4"
+  local resolved_cores="${5:-}"
+  local resolved_flavors="${6:-}"
+
+  kmod_emit_requested_resolved_outputs "$requested_sources" "$resolved_sources" "$requested_streams" "$resolved_streams"
+  echo "resolved_core_list=$resolved_cores" >> "$GITHUB_OUTPUT"
+  echo "resolved_flavor_list=$resolved_flavors" >> "$GITHUB_OUTPUT"
+}
+
+kmod_first_non_empty() {
+  local candidate=""
+
+  for candidate in "$@"; do
+    if [ -n "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  printf '\n'
+}
+
 kmod_run_command_capture() {
   local log_file="$1"
   shift

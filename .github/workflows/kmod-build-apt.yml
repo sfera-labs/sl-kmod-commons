@@ -87,6 +87,9 @@ jobs:
             exit 1
           fi
 
+          # Capture source resolution as soon as sources are validated.
+          kmod_emit_requested_resolved_outputs "$RESOLVED_SOURCES_CSV" "$RESOLVED_SOURCES_CSV" "" ""
+
           kmod_log_section_begin "Configure apt sources"
           kmod_log_requested_resolved_scope "apt" "$RESOLVED_SOURCES_CSV" "$RESOLVED_SOURCES_CSV" "" ""
 
@@ -176,9 +179,6 @@ jobs:
               fi
 
               kmod_log_info "Resolved apt stream '$stream_name' -> suite '$suite_name'"
-              REQUESTED_STREAMS_CSV_PROGRESS="$(kmod_tokens_to_csv "$REQUESTED_STREAMS_NL")"
-              RESOLVED_STREAMS_CSV_PROGRESS="$(kmod_tokens_to_csv "$RESOLVED_STREAMS_NL")"
-              kmod_emit_requested_resolved_outputs "$RESOLVED_SOURCES_CSV" "$RESOLVED_SOURCES_CSV" "$REQUESTED_STREAMS_CSV_PROGRESS" "$RESOLVED_STREAMS_CSV_PROGRESS"
 
               if ! repo_suite_exists "$suite_name"; then
                 kmod_fail "Resolved apt suite '$suite_name' (from stream '$stream_name') is unavailable"
@@ -226,7 +226,6 @@ jobs:
 
           echo "include_rpi_archive=$INCLUDE_RPI_ARCHIVE" >> "$GITHUB_OUTPUT"
           echo "include_ubuntu_archive=$INCLUDE_UBUNTU_ARCHIVE" >> "$GITHUB_OUTPUT"
-          kmod_emit_requested_resolved_outputs "$RESOLVED_SOURCES_CSV" "$RESOLVED_SOURCES_CSV" "$REQUESTED_STREAMS_CSV" "$RESOLVED_STREAMS_CSV"
 
       - name: Discover apt targets
         id: discover
@@ -357,9 +356,7 @@ jobs:
           kmod_log_section_end
 
           echo "target_count=$TARGET_COUNT" >> "$GITHUB_OUTPUT"
-          kmod_emit_requested_resolved_outputs "$REQUESTED_SOURCES" "$RESOLVED_SOURCES" "$REQUESTED_STREAMS" "$RESOLVED_STREAMS"
-          echo "resolved_core_list=$RESOLVED_CORE_LIST" >> "$GITHUB_OUTPUT"
-          echo "resolved_flavor_list=$RESOLVED_FLAVOR_LIST" >> "$GITHUB_OUTPUT"
+          kmod_emit_resolver_scope_outputs "$REQUESTED_SOURCES" "$RESOLVED_SOURCES" "$REQUESTED_STREAMS" "$RESOLVED_STREAMS" "$RESOLVED_CORE_LIST" "$RESOLVED_FLAVOR_LIST"
 
       - name: Build against apt targets
         id: build
@@ -579,19 +576,11 @@ jobs:
           set -euo pipefail
           source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
 
-          REQUESTED_SOURCES="${{ steps.discover.outputs.requested_source_list }}"
-          [ -z "$REQUESTED_SOURCES" ] && REQUESTED_SOURCES="${{ steps.configure_sources.outputs.requested_source_list }}"
-          [ -z "$REQUESTED_SOURCES" ] && REQUESTED_SOURCES="${{ inputs.sources }}"
+          REQUESTED_SOURCES="$(kmod_first_non_empty "${{ steps.discover.outputs.requested_source_list }}" "${{ steps.configure_sources.outputs.requested_source_list }}" "${{ inputs.sources }}")"
+          RESOLVED_SOURCES="$(kmod_first_non_empty "${{ steps.discover.outputs.resolved_source_list }}" "${{ steps.configure_sources.outputs.resolved_source_list }}" "${{ inputs.sources }}")"
 
-          RESOLVED_SOURCES="${{ steps.discover.outputs.resolved_source_list }}"
-          [ -z "$RESOLVED_SOURCES" ] && RESOLVED_SOURCES="${{ steps.configure_sources.outputs.resolved_source_list }}"
-
-          REQUESTED_STREAMS="${{ steps.discover.outputs.requested_stream_list }}"
-          [ -z "$REQUESTED_STREAMS" ] && REQUESTED_STREAMS="${{ steps.configure_sources.outputs.requested_stream_list }}"
-          [ -z "$REQUESTED_STREAMS" ] && REQUESTED_STREAMS="${{ inputs.streams }}"
-
-          RESOLVED_STREAMS="${{ steps.discover.outputs.resolved_stream_list }}"
-          [ -z "$RESOLVED_STREAMS" ] && RESOLVED_STREAMS="${{ steps.configure_sources.outputs.resolved_stream_list }}"
+          REQUESTED_STREAMS="$(kmod_first_non_empty "${{ steps.discover.outputs.requested_stream_list }}" "${{ steps.configure_sources.outputs.requested_stream_list }}" "${{ inputs.streams }}")"
+          RESOLVED_STREAMS="$(kmod_first_non_empty "${{ steps.discover.outputs.resolved_stream_list }}" "${{ steps.configure_sources.outputs.resolved_stream_list }}")"
 
           RESOLVED_CORES="${{ steps.discover.outputs.resolved_core_list }}"
           RESOLVED_FLAVORS="${{ steps.discover.outputs.resolved_flavor_list }}"
