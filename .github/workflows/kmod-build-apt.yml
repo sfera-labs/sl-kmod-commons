@@ -388,11 +388,11 @@ jobs:
             local apt_target_package_spec="$1"
 
             # Keep this helper centralized so all apt download failures have the same diagnostics shape.
-            if (cd "$DOWNLOAD_DIR" && apt download "$apt_target_package_spec" >"$APT_DOWNLOAD_OUTPUT_FILE" 2>&1); then
+            if (cd "$DOWNLOAD_DIR" && apt-get download "$apt_target_package_spec" >"$APT_DOWNLOAD_OUTPUT_FILE" 2>&1); then
               return 0
             fi
 
-            kmod_log_external_output_excerpt "apt download $apt_target_package_spec" "$APT_DOWNLOAD_OUTPUT_FILE" 120
+            kmod_log_external_output_excerpt "apt-get download $apt_target_package_spec" "$APT_DOWNLOAD_OUTPUT_FILE" 120
             return 1
           }
 

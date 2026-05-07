@@ -19,16 +19,16 @@ runs:
         kmod_log_section_begin "Install dependencies"
         kmod_log_info "Runner host architecture: $(dpkg --print-architecture)"
         
-        sudo apt update
+        sudo apt-get update
         
         # Install core build tools and utilities
         BUILD_TOOLS="build-essential jq curl xz-utils gnupg gcc-12 gcc-14 device-tree-compiler"
         [ "${{ inputs.include_git }}" = "true" ] && BUILD_TOOLS="$BUILD_TOOLS git"
         
-        sudo apt install -y $BUILD_TOOLS
+        sudo apt-get install -y $BUILD_TOOLS
         
         # Install cross-compilation toolchains for ARM
-        sudo apt install -y gcc-12-arm-linux-gnueabihf gcc-14-arm-linux-gnueabihf
+        sudo apt-get install -y gcc-12-arm-linux-gnueabihf gcc-14-arm-linux-gnueabihf
 
         # Create symlink for arm-linux-gnueabihf-gcc if not present
         if ! command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
