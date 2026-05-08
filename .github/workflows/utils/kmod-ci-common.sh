@@ -433,15 +433,16 @@ kmod_sanitize_path_token() {
 
 kmod_copy_target_artifacts() {
   local artifact_root="$1"
-  local module_version="$2"
-  local target_version="$3"
-  local dts_value="${4:-}"
+  local target_version="$2"
+  local dts_value="${3:-}"
   local module_name=""
+  local module_software_version=""
   local output_dir=""
   local dts_dir_name=""
 
   module_name="$(kmod_resolve_module_name)"
-  output_dir="$artifact_root/${module_name}-${module_version}-${target_version}"
+  module_software_version="$(kmod_sanitize_path_token "$(tr -d '\r\n' < VERSION)")"
+  output_dir="$artifact_root/${module_name}-${module_software_version}-${target_version}"
   mkdir -p "$output_dir"
   find . -maxdepth 1 -type f -name '*.ko' -exec cp -v {} "$output_dir/" \;
 
@@ -500,7 +501,7 @@ kmod_build_target_with_make_single_dts() {
       return 1
     fi
 
-    kmod_copy_target_artifacts "$artifact_root" "$module_version" "$subject_key" "$dts_value"
+    kmod_copy_target_artifacts "$artifact_root" "$module_version" "$dts_value"
     kmod_log_info "${subject_noun} '$subject_display' build succeeded"
     return 0
   fi
