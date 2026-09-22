@@ -8,10 +8,16 @@ dts_files=( "$MODULE_NAME"*.dts )
 echo "${dts_files[0]%.dts}" > DTS_NAME
 
 dkms add .
-for k in $(ls /lib/modules/ | sort -V | awk -F'rpt-rpi-' '
-    !seen[$2]++ || $0 > latest[$2] { latest[$2]=$0 }
-    END { for (k in latest) print latest[k] }
-'); do
+for k in $(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' |
+    grep 'rpt-rpi-' |
+    sed 's/.*rpt-rpi-//' |
+    sort -u |
+    while read -r flavor; do
+        find /lib/modules -mindepth 1 -maxdepth 1 -type d \
+            -name "*rpt-rpi-$flavor" -printf '%f\n' |
+            sort -V | tail -1
+    done
+); do
     dkms build --force -m "$MODULE_NAME" -v "$VERSION" -k "$k"
     dkms install --force -m "$MODULE_NAME" -v "$VERSION" -k "$k"
 done
