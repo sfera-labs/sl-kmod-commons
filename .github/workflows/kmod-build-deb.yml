@@ -1,0 +1,116 @@
+name: Kernel Module Build (deb package)
+
+on:
+  workflow_call:
+    inputs:
+      module_path:
+        required: false
+        type: string
+        default: '.'
+      source_ref:
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout module repo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Checkout CI utilities repo
+        # Assumption: reusable workflows are consumed from sl-kmod-commons main branch.
+        uses: actions/checkout@v5
+        with:
+          repository: sfera-labs/sl-kmod-commons
+          ref: main
+          path: .kmod-ci-commons
+
+      - name: Build .deb package
+        uses: ./.kmod-ci-commons/.github/workflows/actions/build-deb-package
+        with:
+          module_path: ${{ inputs.module_path }}
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: deb-package
+          path: ${{ inputs.module_path }}/dist/*.deb
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: deb-package
+          path: dist
+
+      - name: Validate tag and package
+        id: package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.source_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          module_name="$(tr -d '[:space:]' < MODULE_NAME)"
+          module_version="$(tr -d '[:space:]' < VERSION)"
+          expected_tag="v$module_version"
+          [[ "$RELEASE_TAG" == "$expected_tag" ]] || {
+            echo "Tag must be $expected_tag to match VERSION=$module_version (got $RELEASE_TAG)" >&2
+            exit 1
+          }
+          shopt -s nullglob
+          packages=(dist/*.deb)
+          [ "${#packages[@]}" -eq 1 ] || {
+            echo "Expected exactly one .deb artifact, found ${#packages[@]}" >&2
+            exit 1
+          }
+          package="$(dpkg-deb --field "${packages[0]}" Package)"
+          version="$(dpkg-deb --field "${packages[0]}" Version)"
+          architecture="$(dpkg-deb --field "${packages[0]}" Architecture)"
+          expected_package="${module_name}-dkms"
+          [ "$package" = "$expected_package" ] || { echo "Expected package $expected_package, got $package" >&2; exit 1; }
+          [ "$architecture" = all ] || { echo "Expected Architecture: all, got $architecture" >&2; exit 1; }
+          case "$version" in
+            "$module_version"-*) ;;
+            *) echo "Package version $version does not match module VERSION $module_version" >&2; exit 1 ;;
+          esac
+          echo "package_file=${packages[0]}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create release and attach package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_FILE: ${{ steps.package.outputs.package_file }}
+          RELEASE_TAG: ${{ steps.package.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          asset_name="${PACKAGE_FILE##*/}"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            existing_dir="$(mktemp -d)"
+            if gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$asset_name" --dir "$existing_dir"; then
+              cmp -s "$PACKAGE_FILE" "$existing_dir/$asset_name" || {
+                echo "Release $RELEASE_TAG already has different bytes for $asset_name" >&2
+                exit 1
+              }
+            else
+              gh release upload "$RELEASE_TAG" "$PACKAGE_FILE" --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$RELEASE_TAG" "$PACKAGE_FILE" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi

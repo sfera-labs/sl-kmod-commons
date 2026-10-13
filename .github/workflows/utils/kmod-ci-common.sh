@@ -142,33 +142,6 @@ kmod_tokens_to_csv() {
   printf '%s\n' "$token_input" | awk 'NF > 0' | paste -sd',' -
 }
 
-kmod_read_build_config_dts_csv() {
-  local config_file="$GITHUB_WORKSPACE/.github/workflows-config/build-config.yml"
-  local dts_raw=""
-
-  if [ ! -f "$config_file" ]; then
-    printf '\n'
-    return 0
-  fi
-
-  dts_raw="$(awk '
-    /^[[:space:]]*dts[[:space:]]*:/ {
-      sub(/^[[:space:]]*dts[[:space:]]*:[[:space:]]*/, "")
-      print
-      exit
-    }
-  ' "$config_file")"
-
-  dts_raw="$(printf '%s' "$dts_raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  case "$dts_raw" in
-    \`*\`) dts_raw="${dts_raw#\`}"; dts_raw="${dts_raw%\`}" ;;
-    \"*\") dts_raw="${dts_raw#\"}"; dts_raw="${dts_raw%\"}" ;;
-    \'*\') dts_raw="${dts_raw#\'}"; dts_raw="${dts_raw%\'}" ;;
-  esac
-
-  printf '%s\n' "$dts_raw"
-}
-
 kmod_csv_to_markdown_list() {
   local label="$1"
   local csv_values="${2:-}"
@@ -471,7 +444,10 @@ kmod_build_target_with_make_single_dts() {
   local cc_bin=""
   local make_label=""
   local ko_count="0"
-  local dtbo_count="0"
+  local module_name=""
+  local dts_source=""
+  local expected_dtbo=""
+  local -a dts_sources=()
   local err_snippet=""
   local err_annotation=""
 
@@ -494,12 +470,28 @@ kmod_build_target_with_make_single_dts() {
   make_label="make CC=$cc_bin ($build_context)"
   if kmod_run_command_capture_with_label "$make_label" "$make_log_file" make CC="$cc_bin"; then
     ko_count="$(find . -maxdepth 1 -type f -name '*.ko' | wc -l | tr -d ' ')"
-    dtbo_count="$(find . -maxdepth 1 -type f -name '*.dtbo' | wc -l | tr -d ' ')"
 
-    if [ "$ko_count" -eq 0 ] || [ "$dtbo_count" -eq 0 ]; then
-      kmod_log_error "${subject_noun} '$subject_display' failed: expected .ko and .dtbo outputs are required"
+    if [ "$ko_count" -eq 0 ]; then
+      kmod_log_error "${subject_noun} '$subject_display' failed: expected .ko output is missing"
       return 1
     fi
+
+    module_name="$(tr -d '[:space:]' < MODULE_NAME)"
+    shopt -s nullglob
+    dts_sources=("${module_name}"*.dts)
+    shopt -u nullglob
+    if [ "${#dts_sources[@]}" -eq 0 ]; then
+      kmod_log_error "${subject_noun} '$subject_display' failed: no ${module_name}*.dts overlay sources were found"
+      return 1
+    fi
+
+    for dts_source in "${dts_sources[@]}"; do
+      expected_dtbo="${dts_source%.dts}.dtbo"
+      if [ ! -f "$expected_dtbo" ]; then
+        kmod_log_error "${subject_noun} '$subject_display' failed: expected overlay '$expected_dtbo' was not produced"
+        return 1
+      fi
+    done
 
     kmod_copy_target_artifacts "$artifact_root" "$module_version" "$dts_value"
     kmod_log_info "${subject_noun} '$subject_display' build succeeded"
@@ -529,66 +521,22 @@ kmod_build_target_with_make() {
   local artifact_root="$8"
   local build_context="$9"
   local make_log_file="${10}"
-  local dts_csv=""
-  local dts_value=""
-  local config_file="$GITHUB_WORKSPACE/.github/workflows-config/build-config.yml"
-  local dts_count=0
-
-  dts_csv="$(kmod_read_build_config_dts_csv)"
-
-  if [ -z "$dts_csv" ]; then
-    if kmod_build_target_with_make_single_dts \
-      "$subject_noun" \
-      "$subject_display" \
-      "$subject_key" \
-      "$module_version" \
-      "$kernel_build_dir" \
-      "$cross_compile_prefix" \
-      "$kernel_arch" \
-      "$artifact_root" \
-      "$build_context" \
-      "$make_log_file"; then
-      kmod_register_success "$subject_key"
-      kmod_log_notice "OK target: $subject_display"
-      return 0
-    fi
-
+  if ! kmod_build_target_with_make_single_dts \
+    "$subject_noun" \
+    "$subject_display" \
+    "$subject_key" \
+    "$module_version" \
+    "$kernel_build_dir" \
+    "$cross_compile_prefix" \
+    "$kernel_arch" \
+    "$artifact_root" \
+    "$build_context" \
+    "$make_log_file"; then
     kmod_register_fail "$subject_key" "make-failed"
     return 1
   fi
-
-  kmod_log_info "DTS config detected for '$subject_display': $dts_csv"
-  while IFS= read -r dts_value; do
-    [ -z "$dts_value" ] && continue
-    dts_count=$((dts_count + 1))
-    printf '%s\n' "$dts_value" > "$GITHUB_WORKSPACE/DTS_NAME"
-    kmod_log_info "Building '$subject_display' with DTS_NAME='$dts_value'"
-
-    if ! kmod_build_target_with_make_single_dts \
-      "$subject_noun" \
-      "$subject_display" \
-      "$subject_key" \
-      "$module_version" \
-      "$kernel_build_dir" \
-      "$cross_compile_prefix" \
-      "$kernel_arch" \
-      "$artifact_root" \
-      "$build_context dts=$dts_value" \
-      "$make_log_file" \
-      "$dts_value"; then
-      kmod_register_fail "$subject_key" "make-failed"
-      return 1
-    fi
-  done < <(kmod_parse_csv_tokens "$dts_csv" false)
-
-  if [ "$dts_count" -eq 0 ]; then
-    kmod_log_error "Build config '$config_file' defines empty dts list"
-    kmod_register_fail "$subject_key" "empty-dts-list"
-    return 1
-  fi
-
   kmod_register_success "$subject_key"
-  kmod_log_notice "OK target: $subject_display (dts_count=$dts_count)"
+  kmod_log_notice "OK target: $subject_display"
   return 0
 }
 

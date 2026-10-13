@@ -1,0 +1,46 @@
+name: Build DKMS Debian Package
+description: Build an installable .deb (debhelper + dh-dkms) for a DKMS kernel module repo
+
+inputs:
+  module_path:
+    description: Path to the module repo root (containing MODULE_NAME/VERSION/dkms.conf)
+    required: false
+    default: '.'
+
+runs:
+  using: composite
+  steps:
+    - name: Install packaging dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+        kmod_log_section_begin "Install packaging dependencies"
+        sudo apt-get update
+        sudo apt-get install -y build-essential debhelper dpkg-dev dkms device-tree-compiler lintian rsync
+        # dh-dkms is a standalone package on newer distros; bundled into dkms on older ones.
+        sudo apt-get install -y dh-dkms || true
+        kmod_log_section_end
+
+    - name: Build .deb
+      shell: bash
+      run: |
+        set -euo pipefail
+        source "$GITHUB_WORKSPACE/.kmod-ci-commons/.github/workflows/utils/kmod-ci-common.sh"
+
+        kmod_log_section_begin "Build .deb"
+        make -C "${{ inputs.module_path }}" deb
+        kmod_log_section_end
+
+    - name: Lint .deb
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        packages=("${{ inputs.module_path }}"/dist/*.deb)
+        if [ "${#packages[@]}" -eq 0 ]; then
+          echo "No .deb package found to lint" >&2
+          exit 1
+        fi
+        lintian --fail-on error "${packages[@]}"
