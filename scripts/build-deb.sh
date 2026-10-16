@@ -41,6 +41,7 @@ rsync -a \
 	--exclude='.*' \
 	--exclude='_DEV' \
 	--exclude='dist' \
+	--exclude='*.md' \
 	"$MODULE_REPO"/ "$SRC_DIR"/
 
 mkdir -p "$SRC_DIR/debian"
