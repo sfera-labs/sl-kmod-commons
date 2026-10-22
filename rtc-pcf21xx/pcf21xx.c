@@ -13,7 +13,6 @@
  *
  * Sfera Labs modules adaptation
  * Author: Sfera Labs <support@sferalabs.cc>
- * Copyright (C) 2022-2026 Sfera Labs S.r.l.
  *
  * Datasheets: https://www.nxp.com/docs/en/data-sheet/PCF2127.pdf
  *             https://www.nxp.com/docs/en/data-sheet/PCF2131DS.pdf
