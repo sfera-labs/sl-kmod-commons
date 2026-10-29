@@ -59,6 +59,28 @@ jobs:
           REQUESTED_SOURCES="$(kmod_tokens_to_csv "$REQUESTED_SOURCES_NL")"
           RESOLVED_SOURCES="$REQUESTED_SOURCES"
 
+          kmod_fetch_url() {
+            local request_url="$1"
+            local response_file="$2"
+            local stderr_file="$3"
+            local http_status=""
+            local curl_exit_code=0
+
+            if http_status="$(curl --fail-with-body --silent --show-error --location \
+              --retry 3 --retry-delay 2 --retry-max-time 30 \
+              --output "$response_file" --write-out '%{http_code}' \
+              "$request_url" 2>"$stderr_file")"; then
+              return 0
+            else
+              curl_exit_code=$?
+            fi
+
+            kmod_log_warn "Request failed: $request_url (curl exit=$curl_exit_code, HTTP status=${http_status:-unavailable})"
+            kmod_log_external_output_excerpt "HTTP response body" "$response_file" 80
+            kmod_log_external_output_excerpt "curl stderr" "$stderr_file" 80
+            return 1
+          }
+
           DEFAULT_BRANCH_RESPONSE_FILE="$RUNNER_TEMP/git-default-branch.json"
           if [ -n "$STREAMS_RAW" ]; then
             REQUESTED_STREAMS_NL="$(kmod_parse_csv_tokens "$STREAMS_RAW" false)"
@@ -96,15 +118,13 @@ jobs:
             versions_extract_log_file="$RUNNER_TEMP/git-versions-extract-${git_stream_name}.log"
             versions_file="$RUNNER_TEMP/git-versions-${git_stream_name}.txt"
 
-            if ! curl -fsSL "https://api.github.com/repos/raspberrypi/firmware/git/trees/${git_stream_name}?recursive=1" > "$tree_json_file" 2>"$tree_query_log_file"; then
+            if ! kmod_fetch_url "https://api.github.com/repos/raspberrypi/firmware/git/trees/${git_stream_name}?recursive=1" "$tree_json_file" "$tree_query_log_file"; then
               kmod_fail "Resolved stream '$git_stream_name' failed discovery: cannot query firmware tree"
-              kmod_log_external_output_excerpt "curl firmware tree ($git_stream_name)" "$tree_query_log_file" 120
               exit 1
             fi
 
-            if ! curl -fsSL "https://raw.githubusercontent.com/raspberrypi/firmware/${git_stream_name}/extra/git_hash" > "$firmware_hash_file" 2>"$hash_query_log_file"; then
+            if ! kmod_fetch_url "https://raw.githubusercontent.com/raspberrypi/firmware/${git_stream_name}/extra/git_hash" "$firmware_hash_file" "$hash_query_log_file"; then
               kmod_fail "Resolved stream '$git_stream_name' failed discovery: cannot fetch linux hash metadata"
-              kmod_log_external_output_excerpt "curl firmware hash ($git_stream_name)" "$hash_query_log_file" 120
               exit 1
             fi
 
