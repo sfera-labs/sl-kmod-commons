@@ -393,6 +393,15 @@ jobs:
             return 1
           }
 
+          apt_log_deb_identity() {
+            local package_role="$1"
+            local package_file="$2"
+
+            kmod_log_info "$package_role deb: $(basename "$package_file")"
+            kmod_log_info "$package_role deb metadata: $(dpkg-deb -f "$package_file" Package Version Architecture | tr '\n' ' ')"
+            kmod_log_info "$package_role deb sha256: $(sha256sum "$package_file" | awk '{ print $1 }')"
+          }
+
           rm -rf "$DOWNLOAD_DIR" "$ARTIFACT_ROOT"
           mkdir -p "$DOWNLOAD_DIR" "$ARTIFACT_ROOT"
 
@@ -485,6 +494,10 @@ jobs:
               continue
             fi
 
+            apt_log_deb_identity "headers" "$HEADERS_DEB"
+            [ -n "$COMMON_DEB" ] && apt_log_deb_identity "common headers" "$COMMON_DEB"
+            apt_log_deb_identity "kbuild" "$KBUILD_DEB"
+
             rm -rf root
             mkdir root
             if ! dpkg-deb -x "$HEADERS_DEB" root/; then
@@ -542,6 +555,16 @@ jobs:
             fi
 
             KDIR_PATH="$GITHUB_WORKSPACE/root/usr/src/$HEADER_DIR_NAME"
+            FIXDEP_PATH="$KDIR_PATH/scripts/basic/fixdep"
+            FIXDEP_RESOLVED_PATH="$(readlink -f "$FIXDEP_PATH" || true)"
+            kmod_log_info "Runner kernel: $(uname -a)"
+            kmod_log_info "fixdep path: $FIXDEP_PATH -> ${FIXDEP_RESOLVED_PATH:-unresolved}"
+            if [ -e "$FIXDEP_PATH" ]; then
+              kmod_log_info "fixdep file type: $(file -b "$FIXDEP_PATH" 2>&1 || true)"
+              kmod_log_info "fixdep sha256: $(sha256sum "$FIXDEP_PATH" | awk '{ print $1 }')"
+            else
+              kmod_log_warn "fixdep is missing at '$FIXDEP_PATH'"
+            fi
             sudo rm -rf /usr/src
             sudo ln -s "$GITHUB_WORKSPACE/root/usr/src" /usr/src
             MAKE_LOG_FILE="$RUNNER_TEMP/apt-make-${KERNEL_VERSION}.log"
